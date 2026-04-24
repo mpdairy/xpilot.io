@@ -1,3 +1,9 @@
-elm-stuff
-elm.js
-xpilot.js
+/target
+dist/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Old Elm prototype build artifacts (kept for reference only)
+/old/elm-stuff
+/old/elm.js
+/old/xpilot.js

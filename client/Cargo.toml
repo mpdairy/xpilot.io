@@ -1,0 +1,21 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+shared = { workspace = true }
+
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = "0.4"
+js-sys = { workspace = true }
+web-sys = { workspace = true }
+console_error_panic_hook = { workspace = true }
+log = { workspace = true }
+console_log = { workspace = true }

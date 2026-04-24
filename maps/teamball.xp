@@ -1,0 +1,152 @@
+#
+# TEAMBALL 2.4 by DR.DEATH <boyns@sdsu.edu>
+# and Bretton Wade <bwade@graphics.cornell.edu>
+#
+playerstartsshielded:no
+allowplayercrashes:no
+targetkillteam:no
+targetteamcollision:no
+treasurekillteam:no
+treasurecollisiondestroys:yes
+treasurecollisionmaykill:no
+teamassign:yes
+mineswallbounce:yes
+itemswallbounce:yes
+ballswallbounce:yes
+shotswallbounce:no
+allownukes:yes
+allowclusters:no
+allowshields:no
+allowmodifiers:yes
+allowlasermodifiers:yes
+minesonradar:yes
+treasuresonradar:yes
+ecmsreprogrammines:yes
+teamimmunity:yes
+minefusetime:0
+maxshieldedwallbouncespeed:30
+maxunshieldedwallbouncespeed:30
+maxshieldedplayerwallbounceangle:180
+maxunshieldedplayerwallbounceangle:180
+playerwallbouncebrakefactor:0.8
+maxitemdensity:0.1
+movingitemprob:1.0
+itemprobmult:0.001
+dropitemonkillprob:1.0
+itemmissileprob:0
+itemlaserprob:0
+itemcloakprob:0
+itemautopilotprob:0
+itemsensorprob:0
+itememergencyshieldprob:0
+itemwideangleprob:0
+itemrearshotprob:0
+itemecmprob:0.9
+itemenergypackprob:0.4
+itememergencythrustprob:0.8
+itemtractorbeamprob:0.8
+itemmineprob:0.5
+itemtankprob:0.5
+itemafterburnerprob:0.005
+itemtransporterprob:0.5
+initialautopilots:4
+initialafterburners:1
+initialtractorbeams:1
+reset:no
+
+mapwidth : 57
+mapheight : 83
+mapname : TEAMBALL 2.4 - 2 teams, 6 balls, 3 shots
+mapauthor : DR.DEATH mods by Toast
+edgewrap : no
+edgebounce : no
+teamplay : yes
+limitedvisibility : no
+gravity : 0.0
+maxplayershots : 3
+
+mapData: \multiline: EndOfMapdata
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+xxxxxxbxs-                                     -axbxxxxxx
+xxxxxbxs-                                       -axbxxxxx
+xxxxbxs-                                         -axbxxxx
+xxxbxs-                     %                     -axbxxx
+xxxbx                                               xbxxx
+xxxbx                      q#w                      xbxxx
+xxxbx                     qxxxw                     xbxxx
+xxxxx                    qx***xw                    xxxxx
+xs  !                   qxs   axw                   !  ax
+x   !                  qxs     axw                  !   x
+#1$ !                 qxs       axw                 ! $1#
+x   !                 xs         ax                 !   x
+#1$ !                 b           b                 ! $1#
+x   !                 gy         th                 !   x
+#1$ !                  gy       th                  ! $1#
+x   !                   gy     th                   !   x
+xw  !                    gbbbbbh                    !  qx
+xxxxx                                               xxxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbxbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbxbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                   tbbbbbbby                   xbxxx
+xxxbx                  th       gy                  xbxxx
+xxxbx                 th         gy                 xbxxx
+xxxbx                th qxw   qxw gy                xbxxx
+xxxbx                b  x-x   x-x  b                xbxxx
+xxxbx                b  axs   axs  b                xbxxx
+xxxbx                b             b                xbxxx
+xxxbxbbbbbbbbbbbbbbbbb      +      bbbbbbbbbbbbbbbbbxbxxx
+xxxbx                b             b                xbxxx
+xxxbx                b  qxw   qxw  b                xbxxx
+xxxbx                b  x-x   x-x  b                xbxxx
+xxxbx                gy axs   axs th                xbxxx
+xxxbx                 gy         th                 xbxxx
+xxxbx                  gy       th                  xbxxx
+xxxbx                   gbbbbbbbh                   xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbxbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbxbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxbx                                               xbxxx
+xxxxx                                               xxxxx
+xs  !                    tbbbbby                    !  ax
+x   !                   th     gy                   !   x
+#2$ !                  th       gy                  ! $2#
+x   !                 th         gy                 !   x
+#2$ !                 b           b                 ! $2#
+x   !                 xw         qx                 !   x
+#2$ !                 axw       qxs                 ! $2#
+x   !                  axw     qxs                  !   x
+xw  !                   axw   qxs                   !  qx
+xxxxx                    ax***xs                    xxxxx
+xxxbx                     axxxs                     xbxxx
+xxxbx                      a#s                      xbxxx
+xxxbx                                               xbxxx
+xxxbxw-                     %                     -qxbxxx
+xxxxbxw-                                         -qxbxxxx
+xxxxxbxw-                                       -qxbxxxxx
+xxxxxxbxw-                                     -qxbxxxxxx
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+EndOfMapdata

@@ -1,0 +1,186 @@
+# Created by xmapedit.color on Tue Mar 14 10:40:56 1995
+
+framespersecond:12
+robots:0
+allowplayercrashes:yes
+allowplayerkilling:yes
+allowshields:no
+playerstartsshielded:yes
+targetkillteam:yes
+teamassign:yes
+teamimmunity:yes
+limitedlives:yes
+allownukes:yes
+playersonradar:yes
+missilesonradar:yes
+treasuresonradar:yes
+shieldeditempickup:no
+shieldedmining:no
+laserisstungun:no
+movingitemprob:0.2
+dropitemonkillprob:0.5
+destroyitemincollisionprob:0.3
+initialfuel:1000
+initialtanks:1
+initialecms:0
+initialmines:0
+initialmissiles:0
+initialcloaks:0
+initialsensors:1
+initialwideangles:0
+initialrearshots:0
+initialtransporters:0
+initiallasers:0
+initialemergencythrusts:0
+initialemergencyshields:0
+initialafterburners:1
+initialautopilots:1
+emcsreprogrammines:yes
+playerminimumstartfuel:500
+targetteamcollision:no
+allowplayerbounces:yes
+itemswallbounce:yes
+shotswallbounce:no
+ballswallbounce:yes
+sparkswallbounce:yes
+debriswallbounce:no
+allowclusters:no
+allowmodifiers:yes
+allowlasermodifiers:yes
+allowshipshapes:yes
+playersonradar:yes
+missilesonradar:yes
+minesonradar:yes
+nukesonradar:yes
+distinguishmissiles:yes
+identifymines:yes
+nukeminsmarts:3
+nukeminmines:3
+emcsreprogrammines:yes
+maxmissilesperpack:1
+minefusetime:420
+detonateitemonkillprob:0.5
+rogueheatprob:0.01
+roguemineprob:0.02
+maxshieldedwallbouncespeed:60
+maxunshieldedwallbouncespeed:60
+maxshieldedplayerwallbounceangle:180
+maxunshieldedplayerwallbounceangle:180
+playerwallbouncebrakefactor:0.5
+limitedlives:yes
+
+mapwidth : 100
+mapheight : 100
+mapname : Blood's Music II
+mapauthor : Blood, TIMID, DR.DEATH
+edgewrap : yes
+teamplay : yes
+oneplayeronly : no
+worldlives : 3
+limitedvisibility : no
+gravity : 0
+maxplayershots : 12
+shotsgravity : yes
+
+mapData: \multiline: EndOfMapdata
+                                       axxxx                       xxxxxxxxx                        
+                                        axxxw                     qxxxxxxxxx                        
+                                          axxw                    xxxxxxxxxx                        
+                                           axxxw                 qxxxxxxxxxxw                       
+         qxw                                axxxw                xxxxxx#xxxxx        qxw            
+         axxw                                axxx               qxxxxs   axxs        xxx            
+          axxw                                axs              qxxxxs               qxxx            
+           axxxxw      qxw                                    qxxxxx                xxxs            
+            axxxxxw   qxxs                                    xxxxxx               qxxs             
+             axxxxxx#xxxs                                     axxxxs              qxxx              
+               axxxxxxxx                                       axxx           qw qxxxs              
+                 axxxxxxw                                       axs           xxxxxxs               
+                   axxxxs                                                     axxxs                 
+                     axs                                                                            
+                                                                                                    
+      qxxw                                                                                          
+      axxxxw                      qxxxw             qxxxw                                           
+       xxxxx                    qxxx#x#xxw          axxxxw                                          
+       axxxs                   qxxxs   axxw          *axxxw                                         
+         axw                  qxs    !   axw           axxx                                         
+          axxw                                          xxx                                   qx    
+           xxx                       b b                xxs                                  qxx    
+           axxw                      b b      qxxw      xs                                   xxs    
+            axs                      gbb     4xxxs      x                                   qxs     
+                          4            b     a#xs       x                                  qxx      
+                      qxxx#w     4     b                a       qxw                        xxs      
+                      xxxxxxw  qx#w                            qxxxxw                     qxs       
+                      xxxxxxxxxxxxx                  qxxw      xxxxxxxxxw                qxs        
+                      axxxxxxxxxxxs               qxxxxxx      xxxxxxxxxx                xx         
+                         axxxxxxxx    4          qxxxxxxx      xxxxxxxxxs               qxs         
+               h          axxxxxxxw  q#w       qxxxxxxxxxw     xxxxxxxxx                xx          
+b   tby tby by  tby       qxxxxxxxxxxxxs      qxxxxxxxxxxx     xxxs  axs                as      bby 
+b   b b b b bgy b        qxxxxxxxxxxxs      qxxxxxxxxxxxxxw    axs                              b b 
+b   b b b b b b b     qxxxxxxxxxxxxs      qxxxxxxxxxxxxxxxx                                     b h 
+b   b b b b b b bby   xxxxxs  axxxs      qxxxxxxxxxx#xxxxxxw                                    bb  
+b   b b b b b b   b   axxxs    axs      qxxxxxxxxxs   axxxxx                                    b y 
+b   b b b b bth   b    axs              axxxxxxxxx      axxxw                                   b b 
+bbb gbh gbh bh  gbh                       axxxxxxx       axxs                                   bbh 
+                                            axxxxs                                                  
+ tb b b tby b tby                             axs                                                 by
+bbb b b b   b b                                                                                   bb
+bhb b b b   b b                                                                                   bg
+  b b b gby b b                                                                                   b 
+  b b b   b b b                                                                                   b 
+  b b b   b b b              qxxw                                                                 b 
+  b bbb gbh b gbh       qxxxxxxxx            qxxxw                                       qxxw     b 
+                        xxxxxxxxx           qxxxxxw                          qxw  qxw    xxxxw      
+                        xxxxxxxxs          qxxxxxxx                          axxxxxxxw  qxxxxxw     
+                       qxxxxxxxx     qxw qxxxxxxxxx                            axxxxxxxxxxxxxxxxw   
+                      qxxxxxxxxxw    axxxxxxxxxxxxx                              axxxxs ax#xxxxxxw  
+                     qxxxxxxxxxxxw     ax#xxxxxxxxs                               xxxx     a#xxxxx  
+                     xxxxxxxxxxxxx         axxxxxx             qxw                axxs    ! axxxxxw 
+                     axxxxs  axxxxw         axxxxs           qxxxxw        qw                axxxxx 
+      xxxxw                   xxxxxxw        axxs            axxxxxw      qxx            tby  axxxxw
+       axxxw                  xxxxxxx                          axxxx      xxs              b    axxx
+          ax                  axxxxxs                          qxxxs     qxx              bb     axx
+       *   a        qxxxw      axs                            qxxxs      axs               b        
+                    xxxxxw                  qxxxxw            axxs                   3   gbh        
+          qw        axxxxxw                qxxxxxxw                        qw      qx#xw            
+       axxxs         axxxxxw              qxxxxxxxx          qxs           xxw   3qxxxxxw           
+        xxs           axxxxx           qxxxxxxxxxxs          xxw           axxxxx#xs  axs           
+        xx             axxs            xxxxxxxxxxs           axxw            axs                   3
+x       as                             axxxxxxxxx             axx                             3   q#
+x                                        axxxxxxxw             axw                       qxxxx#w qxx
+s                                         axxxxxxx              axxw             qw      axxxxxxxxxx
+                    qxw                      axxxs               axxw            axw      axxxxxxxxx
+                    xxxw                                                          axw      axxxxxxxs
+                   qxxxxw                                                          axxw     axxxxxs 
+                  qxxxxxx                                          axxw             axxw     xxxs   
+                 qxxxxxxxw qx#xw                                     axw             axs     axx    
+       qw     xxxxxxxxxxxxxxxxxxw         qxxw            qxxw        ax                      xx    
+      qxxw    axxxxxxxxxxxxxxxxxxxxw      xxxxw         qxxxxxw                               xx    
+      xxxxw    axxxxx#xxxxxxxxxxxxxx      axxxxw        xxxxxxx                               xxw   
+      axxxx     axs     axxxxxxxxxxs       xxxxxxxxw    axxxxxs                               xxxw  
+       xxxx              axxxxxxs          xxxxxxxxxw       as                                axxx  
+       axxx               axxxxx           xxxxxxxxxxxxw                                       axs  
+        xxs                axxxx           axxxxxxxxxxxxw              qxw                          
+        as                  axxx            axxxxxxxxxxxxxw   *        xxxw                         
+                   xxw       axs             axxxxxxxxxxxxxw           axxxw                        
+                   axx                        axxxxxxxxxxxxxw  qx         ax                        
+                    ax                         axxxxxxxxxxxxxxxxs          xw                       
+                                                xxxxxxxxxxxxxxs            xxw      qxx             
+                                                #xxxxxxxxxxxs              xxxw  qxxxxx             
+                                                xxxxxxxxxxxx               axxxx#xxxxxs             
+                                               qxxxxxx#xxxxx                     axxxx              
+       xw                                     qxxxxxs   axxxw   2                !a#xx              
+       xxw                                    xxxxxs     axxxxxx#                  axx              
+       axxxw                                  xxxs        axxxxs             bby    xx              
+         axxxw                                axs          xxxs                b    xx              
+          axxxw                                            axs               tbh    axxxxw          
+            axxxw                                                qxw2  qxw   b       axxxx          
+             axxx                                               qxxx#xxxxx   bbb        ax          
+               axw                                             qxxxxxxxxxs                          
+                ax                                             xxxxxxs              qxw             
+                                                               axxxxx              2xxx             
+                                                                xxxxx             q#xxs             
+                                                                axxxx             xxxx              
+                                                                 axxxw            axxs              
+                                                                  axxxxw 2                          
+                                       qxxxw                       xxxxxx#xw                        
+EndOfMapdata

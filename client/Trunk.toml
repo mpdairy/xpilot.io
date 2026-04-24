@@ -1,0 +1,10 @@
+[build]
+target = "index.html"
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 3000
+open = false
+
+[watch]
+ignore = ["../target", "../old"]
