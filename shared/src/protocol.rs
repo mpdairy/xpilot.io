@@ -11,6 +11,13 @@ pub type RoomId = u32;
 pub type ClientTick = u32;
 pub type ServerTick = u32;
 
+/// Wire-protocol version. Bumped on any incompatible change to client/server
+/// messages (additions of new variants are still backwards-compatible because
+/// of postcard's enum discriminants, but field reorders, removals, or type
+/// changes are not). Federated/community servers in the future use this so a
+/// client can grey out servers it can't talk to.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default)]
 pub struct TickInput {
     pub client_tick: ClientTick,
@@ -40,6 +47,18 @@ pub struct PlayerInfo {
     pub deaths: u32,
     /// `true` while the player is in the respawn timer.
     pub dead: bool,
+}
+
+/// Summary of a room shown in the lobby's room list. Cheap to compute and
+/// stable enough that we can safely cache `player_count` via an atomic
+/// updated by the room.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RoomSummary {
+    pub room_id: RoomId,
+    pub name: String,
+    pub map_name: String,
+    pub player_count: u32,
+    pub cap: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -86,20 +105,41 @@ pub struct Snapshot {
     /// Current scoreboard. Cheap (~30 bytes/player) and lets the HUD always
     /// be in sync without an extra reliable channel.
     pub players: Vec<PlayerInfo>,
+    /// Grid cells of cannons currently destroyed. Empty when all are alive
+    /// (the common case). Client looks each up in the map's BlockGrid to
+    /// know which firing triangle to suppress.
+    pub dead_cannons: Vec<(u32, u32)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ClientMessage {
-    /// First message after connect.
+    /// First message after connect. `protocol_version` lets the server reject
+    /// incompatible clients up front rather than letting state get weird.
     Hello {
         name: String,
         client_kind: ClientKind,
         supports_webrtc: bool,
+        protocol_version: u32,
     },
-    /// Create or join a room.
+    /// Update the player's display name. Sent before each lobby action so
+    /// the name shown in `JoinedRoom`/`PlayerJoined` reflects what the
+    /// player typed in the name field. Ignored once the player is in a room.
+    SetName {
+        name: String,
+    },
+    /// Request the current list of rooms. Server responds with `RoomList`.
+    ListRooms,
+    /// Create a new room with the given name and map, then auto-join it.
+    /// `bot_count` is clamped to 0..=8 server-side.
+    CreateRoom {
+        name: String,
+        map_name: String,
+        bot_count: u32,
+    },
+    /// Join a specific room by id, or quick-join (`None`) which picks a
+    /// non-full room or creates one with the default map if none exist.
     JoinRoom {
         room_id: Option<RoomId>,
-        map_name: Option<String>,
     },
     /// Per-tick input. Sent unreliably (when WebRTC is wired up in M6).
     Input(TickInput),
@@ -119,6 +159,16 @@ pub enum ServerMessage {
     Welcome {
         player_id: PlayerId,
         server_tick: ServerTick,
+        protocol_version: u32,
+    },
+    /// Names of maps the server has loaded. Sent once after Welcome so the
+    /// client's create-room form can populate its picker without a round trip.
+    AvailableMaps {
+        names: Vec<String>,
+    },
+    /// Snapshot of currently-active rooms. Sent in response to `ListRooms`.
+    RoomList {
+        rooms: Vec<RoomSummary>,
     },
     JoinedRoom {
         room_id: RoomId,

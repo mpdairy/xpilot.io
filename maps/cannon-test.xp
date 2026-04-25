@@ -1,0 +1,33 @@
+# Sandbox map for testing cannons. A square arena with one cannon facing
+# each cardinal direction in the middle, plus a few oriented spawns.
+# R = cannon firing up   D = cannon firing left
+# C = cannon firing down F = cannon firing right
+# r/c/d/f = oriented spawn points (open cell, white-line indicator)
+# _ = base spawn (faces up)
+
+mapName: Cannon Test
+mapAuthor: claude
+mapWidth: 24
+mapHeight: 18
+edgeWrap: no
+
+mapData: \multiline: EndOfMapdata
+xxxxxxxxxxxxxxxxxxxxxxxx
+x                      x
+x        _      _      x
+x                      x
+x                      x
+x         R            x
+x                      x
+x      D     F         x
+x                      x
+x                      x
+x         C            x
+x                      x
+x   r          f       x
+x                      x
+x   d          c       x
+x                      x
+x                      x
+xxxxxxxxxxxxxxxxxxxxxxxx
+EndOfMapdata

@@ -20,11 +20,13 @@ use axum::response::Response;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use shared::entities::PlayerId;
-use shared::protocol::{decode, encode, ClientMessage, Reliability, ServerMessage};
+use shared::protocol::{
+    decode, encode, ClientMessage, Reliability, ServerMessage, PROTOCOL_VERSION,
+};
 use tokio::sync::{mpsc, oneshot, RwLock};
 
-use crate::lobby::Lobby;
-use crate::room::RoomCommand;
+use crate::lobby::{Lobby, RoomHandle};
+use crate::room::{JoinResult, RoomCommand};
 use crate::webrtc_session::{server_reliability, WebRtcSession};
 
 const OUTBOUND_BUFFER: usize = 64;
@@ -59,7 +61,7 @@ async fn handle_socket(socket: WebSocket, lobby: Arc<Lobby>) {
         rtc.clone(),
     ));
 
-    let player_id = dispatch_loop(
+    let cleanup = dispatch_loop(
         ws_read,
         rtc_in_rx,
         rtc_in_tx.clone(),
@@ -70,8 +72,8 @@ async fn handle_socket(socket: WebSocket, lobby: Arc<Lobby>) {
     )
     .await;
 
-    if let Some(pid) = player_id {
-        let _ = lobby
+    if let Some((pid, room)) = cleanup {
+        let _ = room
             .room_tx
             .send(RoomCommand::RemovePlayer { player_id: pid })
             .await;
@@ -182,9 +184,10 @@ async fn dispatch_loop(
     signal_tx: mpsc::Sender<ServerMessage>,
     rtc: Arc<RwLock<Option<Arc<WebRtcSession>>>>,
     lobby: Arc<Lobby>,
-) -> Option<PlayerId> {
+) -> Option<(PlayerId, RoomHandle)> {
     let mut player_id: Option<PlayerId> = None;
-    let mut joined = false;
+    let mut player_name: Option<String> = None;
+    let mut current_room: Option<RoomHandle> = None;
 
     loop {
         let cm: ClientMessage = tokio::select! {
@@ -236,7 +239,8 @@ async fn dispatch_loop(
         if !handle_message(
             cm,
             &mut player_id,
-            &mut joined,
+            &mut player_name,
+            &mut current_room,
             &out_tx,
             &signal_tx,
             &rtc,
@@ -249,10 +253,63 @@ async fn dispatch_loop(
         }
     }
 
-    if joined {
-        player_id
-    } else {
-        None
+    match (player_id, current_room) {
+        (Some(pid), Some(room)) => Some((pid, room)),
+        _ => None,
+    }
+}
+
+/// Send AddPlayer to a room and either set `current_room` on success or
+/// surface an Error to the client. The room may have just been destroyed
+/// between lookup and send (idle timeout race) — that surfaces as either a
+/// channel-closed send or a `JoinResult::Closed` ack.
+async fn try_join(
+    room: &RoomHandle,
+    player_id: PlayerId,
+    name: String,
+    out_tx: &mpsc::Sender<ServerMessage>,
+    current_room: &mut Option<RoomHandle>,
+) {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if room
+        .room_tx
+        .send(RoomCommand::AddPlayer {
+            player_id,
+            name,
+            outbound: out_tx.clone(),
+            ack: ack_tx,
+        })
+        .await
+        .is_err()
+    {
+        let _ = out_tx
+            .send(ServerMessage::Error {
+                message: format!("room {} no longer exists", room.room_id),
+            })
+            .await;
+        return;
+    }
+    match ack_rx.await {
+        Ok(ack) => match ack.result {
+            JoinResult::Joined(joined_msg) => {
+                let _ = out_tx.send(joined_msg).await;
+                *current_room = Some(room.clone());
+            }
+            JoinResult::Full => {
+                let _ = out_tx
+                    .send(ServerMessage::Error {
+                        message: format!("room {} is full", room.room_id),
+                    })
+                    .await;
+            }
+        },
+        Err(_) => {
+            let _ = out_tx
+                .send(ServerMessage::Error {
+                    message: format!("room {} did not respond", room.room_id),
+                })
+                .await;
+        }
     }
 }
 
@@ -260,7 +317,8 @@ async fn dispatch_loop(
 async fn handle_message(
     cm: ClientMessage,
     player_id: &mut Option<PlayerId>,
-    joined: &mut bool,
+    player_name: &mut Option<String>,
+    current_room: &mut Option<RoomHandle>,
     out_tx: &mpsc::Sender<ServerMessage>,
     signal_tx: &mpsc::Sender<ServerMessage>,
     rtc: &Arc<RwLock<Option<Arc<WebRtcSession>>>>,
@@ -268,52 +326,137 @@ async fn handle_message(
     lobby: &Arc<Lobby>,
 ) -> bool {
     match cm {
-        ClientMessage::Hello { name, .. } => {
+        ClientMessage::Hello {
+            name,
+            protocol_version,
+            ..
+        } => {
             if player_id.is_some() {
                 return true;
             }
+            if protocol_version != PROTOCOL_VERSION {
+                let _ = out_tx
+                    .send(ServerMessage::Error {
+                        message: format!(
+                            "protocol version mismatch: server={}, client={}",
+                            PROTOCOL_VERSION, protocol_version
+                        ),
+                    })
+                    .await;
+                return false;
+            }
             let pid = lobby.alloc_player_id();
             *player_id = Some(pid);
+            *player_name = Some(name.clone());
             tracing::info!(player_id = pid, %name, "hello");
             let _ = out_tx
                 .send(ServerMessage::Welcome {
                     player_id: pid,
                     server_tick: 0,
+                    protocol_version: PROTOCOL_VERSION,
                 })
                 .await;
+            let _ = out_tx
+                .send(ServerMessage::AvailableMaps {
+                    names: lobby.maps().names_sorted.clone(),
+                })
+                .await;
+            let rooms = lobby.list_rooms().await;
+            let _ = out_tx.send(ServerMessage::RoomList { rooms }).await;
         }
-        ClientMessage::JoinRoom { .. } => {
+        ClientMessage::SetName { name } => {
+            // Only meaningful while the player is still in the lobby — once
+            // joined, the room owns the displayed name. Trim + cap so a
+            // misbehaving client can't dump megabytes into our logs.
+            if current_room.is_some() {
+                return true;
+            }
+            if player_id.is_none() {
+                return true;
+            }
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                let bounded: String = trimmed.chars().take(32).collect();
+                *player_name = Some(bounded);
+            }
+        }
+        ClientMessage::ListRooms => {
+            if player_id.is_none() {
+                return true;
+            }
+            let rooms = lobby.list_rooms().await;
+            let _ = out_tx.send(ServerMessage::RoomList { rooms }).await;
+        }
+        ClientMessage::CreateRoom {
+            name: room_name,
+            map_name,
+            bot_count,
+        } => {
             let pid = match *player_id {
                 Some(p) => p,
                 None => return true,
             };
-            if *joined {
+            if current_room.is_some() {
                 return true;
             }
-            let (ack_tx, ack_rx) = oneshot::channel();
-            let _ = lobby
-                .room_tx
-                .send(RoomCommand::AddPlayer {
-                    player_id: pid,
-                    name: format!("Player{}", pid),
-                    outbound: out_tx.clone(),
-                    ack: ack_tx,
-                })
-                .await;
-            if let Ok(ack) = ack_rx.await {
-                let _ = out_tx.send(ack.joined_message).await;
-                *joined = true;
+            let room = match lobby.create_room(room_name, map_name, bot_count).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = out_tx
+                        .send(ServerMessage::Error { message: e })
+                        .await;
+                    return true;
+                }
+            };
+            let display = player_name
+                .clone()
+                .unwrap_or_else(|| format!("Player{}", pid));
+            try_join(&room, pid, display, out_tx, current_room).await;
+        }
+        ClientMessage::JoinRoom { room_id } => {
+            let pid = match *player_id {
+                Some(p) => p,
+                None => return true,
+            };
+            if current_room.is_some() {
+                return true;
             }
+            let room = match room_id {
+                Some(id) => match lobby.get_room(id).await {
+                    Some(r) => r,
+                    None => {
+                        let _ = out_tx
+                            .send(ServerMessage::Error {
+                                message: format!("room {} not found", id),
+                            })
+                            .await;
+                        return true;
+                    }
+                },
+                None => match lobby.quick_join().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = out_tx
+                            .send(ServerMessage::Error { message: e })
+                            .await;
+                        return true;
+                    }
+                },
+            };
+            let display = player_name
+                .clone()
+                .unwrap_or_else(|| format!("Player{}", pid));
+            try_join(&room, pid, display, out_tx, current_room).await;
         }
         ClientMessage::Input(input) => {
             let pid = match *player_id {
                 Some(p) => p,
                 None => return true,
             };
-            if !*joined {
+            let Some(room) = current_room.as_ref() else {
                 return true;
-            }
-            let _ = lobby
+            };
+            let _ = room
                 .room_tx
                 .send(RoomCommand::Input {
                     player_id: pid,

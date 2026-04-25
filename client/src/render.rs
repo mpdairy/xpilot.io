@@ -1,5 +1,5 @@
 use shared::constants::SHOT_CHARGE_MAX;
-use shared::entities::{EntityId, Ship};
+use shared::entities::{forward, EntityId, Ship};
 use shared::map::{Block, Map};
 use shared::math::Vec2;
 use shared::protocol::PlayerInfo;
@@ -132,6 +132,52 @@ pub fn render(
     }
     ctx.stroke();
 
+    // Second pass — cannon spawn-direction indicators in white. Same viewport
+    // cull as the wall pass; cheap when no cannons are visible (no path
+    // segments emitted).
+    if let Some(grid) = world.map.blocks.as_ref() {
+        let bs = grid.block_size as f64;
+        let min_wx = camera.center.x as f64 - w * 0.5;
+        let max_wx = camera.center.x as f64 + w * 0.5;
+        let min_wy = camera.center.y as f64 - h * 0.5;
+        let max_wy = camera.center.y as f64 + h * 0.5;
+        let mut min_bx = (min_wx / bs).floor() as i64;
+        let mut max_bx = (max_wx / bs).ceil() as i64;
+        let mut min_by = (min_wy / bs).floor() as i64;
+        let mut max_by = (max_wy / bs).ceil() as i64;
+        if !world.map.edge_wrap {
+            min_bx = min_bx.max(0);
+            max_bx = max_bx.min(grid.width as i64);
+            min_by = min_by.max(0);
+            max_by = max_by.min(grid.height as i64);
+        }
+        // Same line width as the wall pass so the indicator reads as a
+        // map element of the same weight, not a glow on top.
+        ctx.set_stroke_style_str("#fff");
+        ctx.begin_path();
+        for by in min_by..max_by {
+            for bx in min_bx..max_bx {
+                emit_spawn_indicator(ctx, &camera, grid, bx, by, world.map.edge_wrap);
+            }
+        }
+        ctx.stroke();
+
+        // Active cannon firing-triangles drawn as a thin white outline —
+        // 1px so the cannon reads more like a ship's silhouette than the
+        // chunkier blue walls around it. Dead cannons skipped; the wall
+        // block stays visible either way.
+        ctx.set_stroke_style_str("#fff");
+        ctx.set_line_width(1.0);
+        ctx.begin_path();
+        for by in min_by..max_by {
+            for bx in min_bx..max_bx {
+                emit_cannon_triangle(ctx, &camera, world, grid, bx, by);
+            }
+        }
+        ctx.stroke();
+        ctx.set_line_width(2.0);
+    }
+
     // Particles (behind ships). Two sources rendered the same way:
     // client-only thruster embers (cosmetic) and server-authored explosion
     // debris (real sim entities, networked). Additive blend so overlapping
@@ -214,29 +260,36 @@ fn draw_local_hud(ctx: &CanvasRenderingContext2d, canvas_w: f64, canvas_h: f64, 
     let mid_y = canvas_h / 2.0;
     let hud_w: f64 = 180.0;
     let hud_h: f64 = 150.0;
-    let bar_w: f64 = 4.0;
+    let bar_w: f64 = 6.0;
 
     let hx = mid_x - hud_w / 2.0;
     let hy = mid_y - hud_h / 2.0;
     let bx = mid_x + hud_w / 2.0;
 
-    // CSS "green" = #008000 — what the Elm version uses.
-    ctx.set_stroke_style_str("green");
-    ctx.set_line_width(2.0);
+    // Dimmer green so the HUD doesn't fight the gameplay for attention.
+    let hud_color = "#070";
+    ctx.set_stroke_style_str(hud_color);
+    ctx.set_line_width(1.0);
 
-    ctx.set_line_cap("round");
-    let dash = js_sys::Array::of2(&JsValue::from_f64(0.0), &JsValue::from_f64(7.0));
+    // Dashed top + bottom boundary lines only — no side walls.
+    let dash = js_sys::Array::of2(&JsValue::from_f64(10.0), &JsValue::from_f64(5.0));
     let _ = ctx.set_line_dash(&dash);
-    ctx.stroke_rect(hx, hy, hud_w, hud_h);
+    ctx.begin_path();
+    ctx.move_to(hx, hy);
+    ctx.line_to(hx + hud_w, hy);
+    ctx.stroke();
+    ctx.begin_path();
+    ctx.move_to(hx, hy + hud_h);
+    ctx.line_to(hx + hud_w, hy + hud_h);
+    ctx.stroke();
     let solid = js_sys::Array::new();
     let _ = ctx.set_line_dash(&solid);
-    ctx.set_line_cap("butt");
 
-    ctx.set_line_width(1.0);
+    // Energy bar — full HUD height, fills bottom-up with current charge.
     ctx.stroke_rect(bx, hy, bar_w, hud_h);
     let fill_h = hud_h * energy;
     let fill_y = hy + (hud_h - fill_h);
-    ctx.set_fill_style_str("green");
+    ctx.set_fill_style_str(hud_color);
     ctx.fill_rect(bx, fill_y, bar_w, fill_h);
 }
 
@@ -263,14 +316,29 @@ fn draw_minimap(
         let _ = ctx.draw_image_with_html_canvas_element(walls, x, y);
     }
 
-    // Ship dots. Local player is yellow so they can find themself instantly.
+    // Ship dots. Local player is yellow so they can find themself instantly,
+    // plus a small heading whisker so the player can tell which way they're
+    // pointing without leaving the radar.
     for ship in world.ships.values() {
         let is_me = local_player_id.map_or(false, |me| me == ship.player_id);
-        ctx.set_fill_style_str(if is_me { "#ff0" } else { "#fff" });
+        let color = if is_me { "#ff0" } else { "#fff" };
+        ctx.set_fill_style_str(color);
         let sx = x + ship.pos.x as f64 * scale;
         let sy = y + ship.pos.y as f64 * scale;
         let r = if is_me { 2.5 } else { 1.5 };
         ctx.fill_rect(sx - r, sy - r, r * 2.0, r * 2.0);
+        if is_me {
+            let dir = forward(ship.angle);
+            let len: f64 = 9.0;
+            let nx = sx + dir.x as f64 * len;
+            let ny = sy + dir.y as f64 * len;
+            ctx.set_stroke_style_str("#fff");
+            ctx.set_line_width(1.5);
+            ctx.begin_path();
+            ctx.move_to(sx, sy);
+            ctx.line_to(nx, ny);
+            ctx.stroke();
+        }
     }
 
     ctx.set_stroke_style_str("rgba(120, 140, 220, 0.6)");
@@ -427,12 +495,24 @@ fn emit_block_outline(
         ctx.line_to(b.0, b.1);
     };
     match grid.get(lookup_x, lookup_y) {
-        Block::Wall => {
+        Block::Wall
+        | Block::CannonFireUp
+        | Block::CannonFireDown
+        | Block::CannonFireLeft
+        | Block::CannonFireRight => {
+            // Active cannon block renders the same 4-sided wall as a plain
+            // Wall — the firing triangle is added by `emit_cannon_triangle`.
             line(tl, tr); // top
             line(tr, br); // right
             line(br, bl); // bottom
             line(bl, tl); // left
         }
+        // Spawn-marker cells (lowercase r/c/d/f) are OPEN — they only
+        // contribute their indicator line in the second pass.
+        Block::CannonUp
+        | Block::CannonDown
+        | Block::CannonLeft
+        | Block::CannonRight => {}
         Block::TriUL => {
             line(tl, tr); // top
             line(tl, bl); // left
@@ -455,6 +535,140 @@ fn emit_block_outline(
         }
         Block::Space | Block::Base => {}
     }
+}
+
+/// Draws an active cannon's firing-triangle as a closed sub-path so the
+/// outer `ctx.fill()` paints it. Skips dead cannons (server marks them in
+/// `dead_cannons`). The triangle's base is along the cell edge facing the
+/// firing direction; the tip sticks `CANNON_TRIANGLE_FRAC` of a block past
+/// that edge into the open cell beyond.
+fn emit_cannon_triangle(
+    ctx: &CanvasRenderingContext2d,
+    camera: &Camera,
+    world: &World,
+    grid: &shared::map::BlockGrid,
+    bx: i64,
+    by: i64,
+) {
+    let bs = grid.block_size;
+    let lookup_x = if world.map.edge_wrap {
+        let w = grid.width as i64;
+        ((bx % w) + w) % w
+    } else {
+        bx
+    };
+    let lookup_y = if world.map.edge_wrap {
+        let h = grid.height as i64;
+        ((by % h) + h) % h
+    } else {
+        by
+    };
+    let block = grid.get(lookup_x, lookup_y);
+    if block.cannon_fire().is_none() {
+        return;
+    }
+    // Alive lookup uses the wrapped (real) cell coords — that's what the
+    // server keys cannons by.
+    let alive = world
+        .cannons
+        .get(&(lookup_x as u32, lookup_y as u32))
+        .map(|c| c.alive)
+        .unwrap_or(true);
+    if !alive {
+        return;
+    }
+    let f = shared::constants::CANNON_TRIANGLE_FRAC;
+    let inset = shared::constants::CANNON_BASE_INSET;
+    let sit = shared::constants::CANNON_SIT_OFFSET;
+    let lx = bx as f32 * bs;
+    let ly = by as f32 * bs;
+    let hx = lx + bs;
+    let hy = ly + bs;
+    // Triangle sits OUTSIDE the wall by `sit` so the wall outline shows
+    // through underneath. Base is inset by `inset` on each end so the wall
+    // outline also extends past the cannon on both sides of the base.
+    let (base_a, base_b, tip) = match block {
+        shared::map::Block::CannonFireUp => (
+            Vec2::new(lx + inset, ly - sit),
+            Vec2::new(hx - inset, ly - sit),
+            Vec2::new(lx + bs * 0.5, ly - sit - f * bs),
+        ),
+        shared::map::Block::CannonFireDown => (
+            Vec2::new(lx + inset, hy + sit),
+            Vec2::new(hx - inset, hy + sit),
+            Vec2::new(lx + bs * 0.5, hy + sit + f * bs),
+        ),
+        shared::map::Block::CannonFireLeft => (
+            Vec2::new(lx - sit, ly + inset),
+            Vec2::new(lx - sit, hy - inset),
+            Vec2::new(lx - sit - f * bs, ly + bs * 0.5),
+        ),
+        shared::map::Block::CannonFireRight => (
+            Vec2::new(hx + sit, ly + inset),
+            Vec2::new(hx + sit, hy - inset),
+            Vec2::new(hx + sit + f * bs, ly + bs * 0.5),
+        ),
+        _ => return,
+    };
+    let a = camera.world_to_screen(base_a);
+    let b = camera.world_to_screen(base_b);
+    let t = camera.world_to_screen(tip);
+    ctx.move_to(a.0, a.1);
+    ctx.line_to(b.0, b.1);
+    ctx.line_to(t.0, t.1);
+    ctx.close_path();
+}
+
+/// Draws the spawn-direction indicator line on a cell. The line acts as the
+/// "back wall" the ship rests against, with its perpendicular giving the
+/// facing direction — so for an up-facing spawn the line sits along the
+/// BOTTOM edge of the cell. Skips cells that aren't bases or cannons.
+fn emit_spawn_indicator(
+    ctx: &CanvasRenderingContext2d,
+    camera: &Camera,
+    grid: &shared::map::BlockGrid,
+    bx: i64,
+    by: i64,
+    edge_wrap: bool,
+) {
+    let bs = grid.block_size;
+    let (lookup_x, lookup_y) = if edge_wrap {
+        let w = grid.width as i64;
+        let h = grid.height as i64;
+        (((bx % w) + w) % w, ((by % h) + h) % h)
+    } else {
+        (bx, by)
+    };
+    let block = grid.get(lookup_x, lookup_y);
+    if !matches!(
+        block,
+        Block::Base
+            | Block::CannonUp
+            | Block::CannonDown
+            | Block::CannonLeft
+            | Block::CannonRight
+    ) {
+        return;
+    }
+    let lx = bx as f32 * bs;
+    let ly = by as f32 * bs;
+    let hx = lx + bs;
+    let hy = ly + bs;
+    let tl = camera.world_to_screen(Vec2::new(lx, ly));
+    let tr = camera.world_to_screen(Vec2::new(hx, ly));
+    let bl = camera.world_to_screen(Vec2::new(lx, hy));
+    let br = camera.world_to_screen(Vec2::new(hx, hy));
+    // Indicator sits on the side OPPOSITE the spawn-facing direction —
+    // perpendicular to it gives the ship's heading. Bases face up by default.
+    let (a, b) = match block {
+        Block::CannonUp | Block::Base => (bl, br), // back wall = bottom, ship faces up
+        Block::CannonDown => (tl, tr),             // back wall = top, ship faces down
+        Block::CannonLeft => (tr, br),             // back wall = right, ship faces left
+        Block::CannonRight => (tl, bl),            // back wall = left, ship faces right
+        _ => return,
+    };
+    ctx.move_to(a.0, a.1);
+    ctx.line_to(b.0, b.1);
 }
 
 pub fn render_status(ctx: &CanvasRenderingContext2d, canvas: &HtmlCanvasElement, status: &str) {

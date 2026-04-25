@@ -1,9 +1,14 @@
 // Parser for classic XPilot block-based `.xp` / `.map` files.
 //
 // Format reference: ../../xpilot_maps.md (and `doc/README.MAPS` in the
-// xpilot 4.5.5 source). Phase 1 only — we recognize walls (full + 4
-// triangles), bases, and space; everything else (cannons, fuel, items,
-// gravity, wormholes, checkpoints) becomes empty space.
+// xpilot 4.5.5 source). What we recognize today:
+//   - walls (`x`) and the four triangle-wall slopes (`s/a/w/q`)
+//   - bases (`_`, `0`–`9`) → upward-facing spawn points
+//   - cannons (`r/c/d/f`) → solid block + directional spawn point one cell out
+//   - solid-looking obstacles we don't otherwise model (`#` fuel, `!` target,
+//     `^` treasure box, `*` ball treasure) → plain wall
+// Non-solid features (gravity wells, wormholes, items, checkpoints) become
+// empty space — they don't block movement and we have no other use for them.
 
 use crate::map::{Block, BlockGrid, Map, SpawnPoint};
 use crate::math::Vec2;
@@ -44,6 +49,23 @@ fn block_from_char(c: char) -> Block {
         'w' => Block::TriLL,
         'q' => Block::TriLR,
         '_' | '0'..='9' => Block::Base,
+        // Lowercase cannons (classic XPilot's r/c/d/f) repurposed as
+        // oriented spawn-point markers — open cells with a white-line
+        // indicator on the back wall.
+        'r' => Block::CannonUp,
+        'c' => Block::CannonDown,
+        'd' => Block::CannonLeft,
+        'f' => Block::CannonRight,
+        // Uppercase cannons — the actual classic-XPilot turret. Solid wall
+        // block + visible firing triangle + periodic shot + destructible.
+        'R' => Block::CannonFireUp,
+        'C' => Block::CannonFireDown,
+        'D' => Block::CannonFireLeft,
+        'F' => Block::CannonFireRight,
+        // Solid blocks we don't otherwise model — render+collide as plain
+        // walls so the map's intended geometry is preserved (without these,
+        // big maps full of fuel stations turn into open holes).
+        '#' | '!' | '^' | '*' => Block::Wall,
         _ => Block::Space,
     }
 }
@@ -85,13 +107,23 @@ pub fn parse(content: &str) -> Result<Map, ParseError> {
     let mut spawns: Vec<SpawnPoint> = Vec::new();
     for y in 0..height as i64 {
         for x in 0..width as i64 {
-            if matches!(grid.get(x, y), Block::Base) {
+            let block = grid.get(x, y);
+            if matches!(block, Block::Base) {
                 let cx = (x as f32 + 0.5) * BLOCK_SZ;
                 let cy = (y as f32 + 0.5) * BLOCK_SZ;
                 // Bases face up = angle 0 in this engine (forward = (0, -1)).
                 spawns.push(SpawnPoint {
                     pos: Vec2::new(cx, cy),
                     angle: 0.0,
+                });
+            } else if let Some(angle) = block.cannon_angle() {
+                // Cannon cell is open — ship spawns at its center facing
+                // the cannon direction.
+                let cx = (x as f32 + 0.5) * BLOCK_SZ;
+                let cy = (y as f32 + 0.5) * BLOCK_SZ;
+                spawns.push(SpawnPoint {
+                    pos: Vec2::new(cx, cy),
+                    angle,
                 });
             }
         }
@@ -261,5 +293,91 @@ ZZZ
     fn missing_mapdata_errors() {
         let err = parse("mapWidth: 1\nmapHeight: 1\n").unwrap_err();
         assert!(matches!(err, ParseError::NoMapData));
+    }
+
+    #[test]
+    fn cannons_emit_directional_spawn_points() {
+        // 5×5 with one cannon facing each cardinal direction. Each cannon's
+        // spawn should land at the cell's own center, facing the cannon's
+        // direction.
+        let src = "\
+mapWidth: 5
+mapHeight: 5
+mapData: \\multiline: END
+
+  r
+ d f
+  c
+
+END
+";
+        let m = parse(src).unwrap();
+        assert_eq!(m.spawns.len(), 4);
+        let bs = BLOCK_SZ;
+        let center = |x: f32, y: f32| Vec2::new((x + 0.5) * bs, (y + 0.5) * bs);
+        // CannonUp at (2,1) → spawn at (2,1) facing 0 (up).
+        let up = m
+            .spawns
+            .iter()
+            .find(|s| s.angle.abs() < 1e-3)
+            .expect("up spawn");
+        assert!((up.pos - center(2.0, 1.0)).length() < 1e-3);
+        // CannonRight at (3,2) → spawn at (3,2) facing +PI/2.
+        let right = m
+            .spawns
+            .iter()
+            .find(|s| (s.angle - core::f32::consts::FRAC_PI_2).abs() < 1e-3)
+            .expect("right spawn");
+        assert!((right.pos - center(3.0, 2.0)).length() < 1e-3);
+        // CannonDown at (2,3) → spawn at (2,3) facing PI.
+        let down = m
+            .spawns
+            .iter()
+            .find(|s| (s.angle - core::f32::consts::PI).abs() < 1e-3)
+            .expect("down spawn");
+        assert!((down.pos - center(2.0, 3.0)).length() < 1e-3);
+        // CannonLeft at (1,2) → spawn at (1,2) facing -PI/2.
+        let left = m
+            .spawns
+            .iter()
+            .find(|s| (s.angle + core::f32::consts::FRAC_PI_2).abs() < 1e-3)
+            .expect("left spawn");
+        assert!((left.pos - center(1.0, 2.0)).length() < 1e-3);
+    }
+
+    #[test]
+    fn cannon_cell_emits_no_walls() {
+        // Cannon is an open cell — only the bounding box of a wrap-disabled
+        // map shows up, none of the 4 sides of the cannon block itself.
+        let src = "\
+mapWidth: 3
+mapHeight: 3
+edgeWrap: yes
+mapData: \\multiline: END
+
+ r
+
+END
+";
+        let m = parse(src).unwrap();
+        assert_eq!(m.walls.len(), 0);
+    }
+
+    #[test]
+    fn fuel_block_is_solid_wall() {
+        // `#` used to be silently dropped as Space, leaving holes in maps.
+        // Now it should behave as a plain wall block.
+        let src = "\
+mapWidth: 3
+mapHeight: 3
+edgeWrap: yes
+mapData: \\multiline: END
+
+ #
+
+END
+";
+        let m = parse(src).unwrap();
+        assert_eq!(m.walls.len(), 4);
     }
 }

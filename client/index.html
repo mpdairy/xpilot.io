@@ -5,11 +5,111 @@
     <title>xpilot.io</title>
     <link data-trunk rel="rust" data-wasm-opt="z" />
     <style>
-      html, body { margin: 0; padding: 0; background: #000; color: #fff; font-family: monospace; }
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: #000;
+        color: #cfc;
+        font-family: monospace;
+      }
       #game { display: block; margin: 0 auto; background: #000; }
+      #game[hidden] { display: none; }
+
+      #lobby {
+        max-width: 720px;
+        margin: 40px auto;
+        padding: 24px;
+        border: 1px solid #2a4;
+      }
+      #lobby[hidden] { display: none; }
+      #lobby h1 { margin: 0 0 8px 0; font-size: 28px; color: #5f5; }
+      #lobby h2 { margin: 24px 0 8px 0; font-size: 16px; color: #9f9; }
+      #lobby .row { margin: 12px 0; display: flex; gap: 8px; align-items: center; }
+      #lobby label { min-width: 90px; }
+      #lobby input, #lobby select {
+        background: #021;
+        color: #cfc;
+        border: 1px solid #2a4;
+        padding: 6px 8px;
+        font-family: inherit;
+        font-size: 14px;
+        flex: 1;
+      }
+      #lobby button {
+        background: #042;
+        color: #cfc;
+        border: 1px solid #4c8;
+        padding: 6px 14px;
+        font-family: inherit;
+        font-size: 14px;
+        cursor: pointer;
+      }
+      #lobby button:hover { background: #063; }
+      #lobby button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+      #room-list {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 8px;
+      }
+      #room-list th, #room-list td {
+        text-align: left;
+        padding: 6px 8px;
+        border-bottom: 1px solid #163;
+      }
+      #room-list th { color: #9f9; font-weight: normal; }
+      #room-list .empty { color: #686; font-style: italic; padding: 12px 8px; }
+      #room-list .full { color: #d66; }
+
+      #status { margin-top: 16px; min-height: 1.2em; color: #fc6; }
+      .hint { color: #686; font-size: 12px; }
     </style>
   </head>
   <body>
-    <canvas id="game" width="1200" height="700"></canvas>
+    <div id="lobby" hidden>
+      <h1>xpilot.io</h1>
+      <div class="row">
+        <label for="player-name">Name</label>
+        <input id="player-name" maxlength="20" value="Player" />
+      </div>
+
+      <h2>Rooms</h2>
+      <div class="row">
+        <button id="quick-join">Quick Join</button>
+        <button id="refresh">Refresh</button>
+      </div>
+      <table id="room-list">
+        <thead>
+          <tr>
+            <th>Room</th>
+            <th>Map</th>
+            <th>Players</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="room-list-body">
+          <tr><td colspan="4" class="empty">no rooms — quick join will create one</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Create Room</h2>
+      <div class="row">
+        <label for="new-room-name">Name</label>
+        <input id="new-room-name" maxlength="32" placeholder="e.g. 'arena 1'" />
+      </div>
+      <div class="row">
+        <label for="new-room-map">Map</label>
+        <select id="new-room-map"></select>
+      </div>
+      <div class="row">
+        <label for="new-room-bots">Bots</label>
+        <input id="new-room-bots" type="number" min="0" max="8" value="4" style="flex: 0 0 80px;" />
+        <button id="create-room">Create</button>
+      </div>
+      <div class="hint">controls: A/S turn, Shift thrust, Space fire</div>
+      <div id="status"></div>
+    </div>
+
+    <canvas id="game" width="1200" height="700" hidden></canvas>
   </body>
 </html>

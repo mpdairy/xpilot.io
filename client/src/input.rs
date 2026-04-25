@@ -52,9 +52,15 @@ impl InputState {
 /// Wire window keydown/keyup to the shared input state. Stores the closures in
 /// the window so they outlive this call (we never tear them down — the page is
 /// the lifecycle).
+///
+/// Ignores events whose target is a form field — without this, typing a room
+/// name in the lobby would also rotate the ship and queue a respawn.
 pub fn install_listeners(window: &Window, state: Rc<InputState>) -> Result<(), JsValue> {
     let s = state.clone();
     let down = Closure::<dyn FnMut(KeyboardEvent)>::new(move |ev: KeyboardEvent| {
+        if event_in_form_field(&ev) {
+            return;
+        }
         if s.apply(&ev.code(), true) {
             ev.prevent_default();
         }
@@ -64,6 +70,9 @@ pub fn install_listeners(window: &Window, state: Rc<InputState>) -> Result<(), J
 
     let s = state;
     let up = Closure::<dyn FnMut(KeyboardEvent)>::new(move |ev: KeyboardEvent| {
+        if event_in_form_field(&ev) {
+            return;
+        }
         if s.apply(&ev.code(), false) {
             ev.prevent_default();
         }
@@ -72,4 +81,10 @@ pub fn install_listeners(window: &Window, state: Rc<InputState>) -> Result<(), J
     up.forget();
 
     Ok(())
+}
+
+fn event_in_form_field(ev: &KeyboardEvent) -> bool {
+    let Some(target) = ev.target() else { return false };
+    let Some(el) = target.dyn_ref::<web_sys::Element>() else { return false };
+    matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT" | "BUTTON")
 }

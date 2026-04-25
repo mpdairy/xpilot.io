@@ -5,10 +5,13 @@
 // (and PlayerJoined/Left events) without blocking the sim.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use shared::constants::{
-    SHIP_RESPAWN_SECONDS, SNAPSHOT_RATE_HZ, TICK_DT_SECONDS, TICK_RATE_HZ,
+    ROOM_IDLE_TIMEOUT_SECONDS, ROOM_PLAYER_CAP, SHIP_RESPAWN_SECONDS, SNAPSHOT_RATE_HZ,
+    TICK_DT_SECONDS, TICK_RATE_HZ,
 };
 use shared::entities::{EntityId, PlayerId};
 use shared::map::Map;
@@ -19,10 +22,12 @@ use shared::protocol::{
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, MissedTickBehavior};
 
-const ROOM_ID: RoomId = 1;
+use crate::lobby::RoomRegistry;
+
 const SIM_PERIOD: Duration = Duration::from_nanos((1_000_000_000.0 / TICK_RATE_HZ as f64) as u64);
 const SNAPSHOTS_EVERY_N_TICKS: u32 = TICK_RATE_HZ / SNAPSHOT_RATE_HZ;
 const RESPAWN_TICKS: u32 = (SHIP_RESPAWN_SECONDS / TICK_DT_SECONDS) as u32;
+const IDLE_DESTROY: Duration = Duration::from_secs(ROOM_IDLE_TIMEOUT_SECONDS as u64);
 
 pub enum RoomCommand {
     AddPlayer {
@@ -40,8 +45,13 @@ pub enum RoomCommand {
     },
 }
 
+pub enum JoinResult {
+    Joined(ServerMessage),
+    Full,
+}
+
 pub struct JoinAck {
-    pub joined_message: ServerMessage,
+    pub result: JoinResult,
 }
 
 struct Player {
@@ -64,31 +74,81 @@ impl Player {
 }
 
 /// Bot ID space lives well above any human player id (lobby allocates from 1
-/// upward) so there's no collision risk from this little mini-counter.
+/// upward) so there's no collision risk. `+room_id*N` keeps Sid IDs unique
+/// across rooms — otherwise two rooms' Sids would clash if both lived in any
+/// global structure (none today, but cheap insurance).
 const BOT_PLAYER_ID_BASE: PlayerId = 1_000_000;
+const BOT_IDS_PER_ROOM: PlayerId = 100;
+/// Names lifted from classic xpilot.org screenshots — flavour only. Sliced
+/// to `bot_count` at room start; an enclosing call clamps to `<= 8`.
+const BOT_NAMES: [&str; 8] = [
+    "Sid", "Cobra", "Wimpy", "Slugger", "Spike", "Diesel", "Reaper", "Vega",
+];
 
-pub async fn run(map: Map, mut commands: mpsc::Receiver<RoomCommand>) {
+pub async fn run(
+    room_id: RoomId,
+    map: Map,
+    mut commands: mpsc::Receiver<RoomCommand>,
+    human_count: Arc<AtomicUsize>,
+    registry: RoomRegistry,
+    bot_count: u32,
+) {
     let mut world = shared::world::World::new(map.clone());
     let mut players: BTreeMap<PlayerId, Player> = BTreeMap::new();
     let mut latest_inputs: BTreeMap<EntityId, TickInput> = BTreeMap::new();
-    /// PlayerIds of bots in this room. Brains run before each sim step.
+    // PlayerIds of bots in this room. Brains run before each sim step.
     let mut bots: Vec<PlayerId> = Vec::new();
 
-    // Spawn one Sid bot up front so the arena's never empty.
-    let sid_pid = BOT_PLAYER_ID_BASE;
-    spawn_bot(sid_pid, "Sid".into(), &mut world, &mut players);
-    bots.push(sid_pid);
+    // Pre-populate with the requested number of bots. All share the same
+    // brain (`bot::sid_tick`) — names are just for HUD distinction.
+    let bot_id_base = BOT_PLAYER_ID_BASE + room_id as PlayerId * BOT_IDS_PER_ROOM;
+    let n = (bot_count as usize).min(BOT_NAMES.len());
+    for (i, name) in BOT_NAMES.iter().take(n).enumerate() {
+        let pid = bot_id_base + i as PlayerId;
+        spawn_bot(pid, (*name).into(), &mut world, &mut players);
+        bots.push(pid);
+    }
 
     let mut sim = interval(SIM_PERIOD);
     sim.set_missed_tick_behavior(MissedTickBehavior::Burst);
 
     let mut tick_counter: u32 = 0;
+    // Set on construction and reset whenever humans drops to zero. Cleared
+    // when a human joins. Once it's been Some(t) longer than IDLE_DESTROY,
+    // the room removes itself from the registry and exits.
+    let mut empty_since: Option<Instant> = Some(Instant::now());
 
     loop {
+        // Idle-shutdown check. Done at the top so a room with zero humans
+        // and no incoming commands will wake up via the sim tick and exit.
+        if let Some(t) = empty_since {
+            if t.elapsed() >= IDLE_DESTROY {
+                registry.write().await.remove(&room_id);
+                tracing::info!(room_id, "destroyed (idle)");
+                break;
+            }
+        }
+
         tokio::select! {
             cmd = commands.recv() => {
                 match cmd {
-                    Some(c) => handle_command(c, &mut world, &mut players, &mut latest_inputs).await,
+                    Some(c) => {
+                        let was_empty = human_count.load(Ordering::Relaxed) == 0;
+                        handle_command(
+                            c,
+                            room_id,
+                            &mut world,
+                            &mut players,
+                            &mut latest_inputs,
+                            &human_count,
+                        ).await;
+                        let now_empty = human_count.load(Ordering::Relaxed) == 0;
+                        if !now_empty {
+                            empty_since = None;
+                        } else if !was_empty {
+                            empty_since = Some(Instant::now());
+                        }
+                    }
                     None => break,
                 }
             }
@@ -150,12 +210,20 @@ pub async fn run(map: Map, mut commands: mpsc::Receiver<RoomCommand>) {
 
 async fn handle_command(
     cmd: RoomCommand,
+    room_id: RoomId,
     world: &mut shared::world::World,
     players: &mut BTreeMap<PlayerId, Player>,
     latest_inputs: &mut BTreeMap<EntityId, TickInput>,
+    human_count: &Arc<AtomicUsize>,
 ) {
     match cmd {
         RoomCommand::AddPlayer { player_id, name, outbound, ack } => {
+            // Cap is humans-only; bots don't compete for slots.
+            if human_count.load(Ordering::Relaxed) >= ROOM_PLAYER_CAP {
+                let _ = ack.send(JoinAck { result: JoinResult::Full });
+                tracing::info!(player_id, room_id, "join rejected — room full");
+                return;
+            }
             let outbound = Some(outbound);
             let (pos, angle) = pick_safe_spawn(world);
             let entity_id = world.spawn_ship(player_id, pos, angle);
@@ -175,7 +243,7 @@ async fn handle_command(
             }))
             .collect();
             let joined = ServerMessage::JoinedRoom {
-                room_id: ROOM_ID,
+                room_id,
                 map: world.map.clone(),
                 players: player_infos,
                 your_ship_id: entity_id,
@@ -205,10 +273,11 @@ async fn handle_command(
                     respawn_at_tick: None,
                 },
             );
+            human_count.fetch_add(1, Ordering::Relaxed);
             let _ = ack.send(JoinAck {
-                joined_message: joined,
+                result: JoinResult::Joined(joined),
             });
-            tracing::info!(player_id, entity_id, "player joined");
+            tracing::info!(player_id, entity_id, room_id, "player joined");
         }
         RoomCommand::Input { player_id, input } => {
             if let Some(p) = players.get_mut(&player_id) {
@@ -222,7 +291,8 @@ async fn handle_command(
             if let Some(p) = players.remove(&player_id) {
                 world.ships.remove(&p.entity_id);
                 latest_inputs.remove(&p.entity_id);
-                tracing::info!(player_id, "player left");
+                human_count.fetch_sub(1, Ordering::Relaxed);
+                tracing::info!(player_id, room_id, "player left");
                 let pl = ServerMessage::PlayerLeft(player_id);
                 for other in players.values() {
                     if let Some(out) = other.outbound.as_ref() {
@@ -326,6 +396,12 @@ fn broadcast_snapshot(world: &shared::world::World, players: &BTreeMap<PlayerId,
     let ships: Vec<_> = world.ships.values().cloned().collect();
     let bullets: Vec<_> = world.bullets.values().cloned().collect();
     let particles = world.particles.clone();
+    let dead_cannons: Vec<(u32, u32)> = world
+        .cannons
+        .iter()
+        .filter(|(_, c)| !c.alive)
+        .map(|(cell, _)| *cell)
+        .collect();
     let server_tick: ServerTick = world.tick;
     let player_infos: Vec<PlayerInfo> = players
         .iter()
@@ -346,6 +422,7 @@ fn broadcast_snapshot(world: &shared::world::World, players: &BTreeMap<PlayerId,
             bullets: bullets.clone(),
             particles: particles.clone(),
             players: player_infos.clone(),
+            dead_cannons: dead_cannons.clone(),
         };
         let _ = out.try_send(ServerMessage::Snapshot(snap));
     }

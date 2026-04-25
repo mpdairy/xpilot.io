@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{routing::get, Router};
-use shared::map::Map;
 use tower_http::cors::{Any, CorsLayer};
 
 mod bot;
@@ -12,7 +11,7 @@ mod lobby;
 mod room;
 mod webrtc_session;
 
-use lobby::Lobby;
+use lobby::{Lobby, MapRegistry};
 
 #[tokio::main]
 async fn main() {
@@ -23,23 +22,32 @@ async fn main() {
         )
         .init();
 
-    let map = match load_default_map() {
+    let dir: PathBuf = std::env::var_os("XPILOT_MAPS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("maps"));
+    let maps = match MapRegistry::load_from_dir(&dir) {
         Ok(m) => m,
         Err(e) => {
-            tracing::error!("could not load map: {}", e);
+            tracing::error!("could not load maps: {}", e);
             std::process::exit(1);
         }
     };
     tracing::info!(
-        name = %map.name,
-        width = map.width,
-        height = map.height,
-        walls = map.walls.len(),
-        spawns = map.spawns.len(),
-        "loaded map"
+        count = maps.names_sorted.len(),
+        names = ?maps.names_sorted,
+        "loaded maps"
     );
+    let default_map = std::env::var("XPILOT_DEFAULT_MAP").unwrap_or_else(|_| "tournament".into());
+    if !maps.contains(&default_map) {
+        tracing::error!(
+            "default map '{}' not in maps dir; available: {:?}",
+            default_map,
+            maps.names_sorted
+        );
+        std::process::exit(1);
+    }
 
-    let lobby = Arc::new(Lobby::new(map));
+    let lobby = Arc::new(Lobby::new(maps, default_map));
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -57,24 +65,4 @@ async fn main() {
     )
     .await
     .unwrap();
-}
-
-/// Resolve and load the map for the single room. Selection precedence:
-/// 1. `XPILOT_MAP` env var (basename without extension)
-/// 2. `tournament` (smallest of the bundled classics)
-///
-/// Map directory comes from `XPILOT_MAPS_DIR` (default `./maps`).
-fn load_default_map() -> Result<Map, String> {
-    let dir: PathBuf = std::env::var_os("XPILOT_MAPS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("maps"));
-    let name = std::env::var("XPILOT_MAP").unwrap_or_else(|_| "tournament".into());
-    let path = dir.join(format!("{}.xp", name));
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("read {}: {}", path.display(), e))?;
-    // Classic .xp files are predominantly ASCII but some carry author names
-    // in legacy 8-bit encodings (e.g. globe.xp's "Björn"). Lossy decode is
-    // good enough since we only use the text bytes for keys and the grid.
-    let src = String::from_utf8_lossy(&bytes);
-    shared::xp_map::parse(&src).map_err(|e| format!("parse {}: {}", path.display(), e))
 }

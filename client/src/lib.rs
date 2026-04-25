@@ -8,13 +8,19 @@ use shared::constants::{
 };
 use shared::entities::{forward, Bullet, EntityId, Ship};
 use shared::math::Vec2;
-use shared::protocol::{ClientKind, ClientMessage, GameEvent, ServerMessage, Snapshot, TickInput};
+use shared::protocol::{
+    ClientKind, ClientMessage, GameEvent, RoomSummary, ServerMessage, Snapshot, TickInput,
+    PROTOCOL_VERSION,
+};
 use shared::physics;
-use shared::world::{apply_ship_dynamics, step_bullet, try_fire, World};
+use shared::world::{apply_ship_dynamics, step_bullet, try_fire, wrap_pos, World};
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
+use web_sys::{
+    CanvasRenderingContext2d, Document, HtmlButtonElement, HtmlCanvasElement, HtmlInputElement,
+    HtmlSelectElement,
+};
 
 mod input;
 mod particles;
@@ -51,6 +57,9 @@ struct App {
     last_time_ms: Option<f64>,
     game: Option<GameView>,
     status: String,
+    /// Cached map names from the server's `AvailableMaps` push. Re-populated
+    /// into the create-room dropdown whenever they arrive.
+    available_maps: Vec<String>,
 }
 
 struct TimedSnapshot {
@@ -119,6 +128,7 @@ pub fn start() -> Result<(), JsValue> {
 
     let app_msg = app.clone();
     let app_open = app.clone();
+    let document_for_open = document.clone();
     let transport = Transport::connect(
         &url,
         move |msg: ServerMessage| {
@@ -130,15 +140,14 @@ pub fn start() -> Result<(), JsValue> {
         move || {
             let guard = app_open.borrow();
             if let Some(a) = guard.as_ref() {
+                let name = read_player_name(&document_for_open);
                 a.transport.send(&ClientMessage::Hello {
-                    name: "Player".into(),
+                    name,
                     client_kind: ClientKind::Human,
                     supports_webrtc: true,
+                    protocol_version: PROTOCOL_VERSION,
                 });
-                a.transport.send(&ClientMessage::JoinRoom {
-                    room_id: None,
-                    map_name: None,
-                });
+                a.transport.send(&ClientMessage::ListRooms);
             }
         },
     )?;
@@ -154,10 +163,215 @@ pub fn start() -> Result<(), JsValue> {
         last_time_ms: None,
         game: None,
         status: "connecting…".into(),
+        available_maps: Vec::new(),
     });
 
+    show_lobby(&document, true);
+    install_lobby_handlers(&document, app.clone())?;
     install_focus_clear(&window, app.clone())?;
     spawn_animation_loop(app);
+    Ok(())
+}
+
+fn read_player_name(doc: &Document) -> String {
+    doc.get_element_by_id("player-name")
+        .and_then(|el| el.dyn_into::<HtmlInputElement>().ok())
+        .map(|el| {
+            let v = el.value().trim().to_string();
+            if v.is_empty() { "Player".into() } else { v }
+        })
+        .unwrap_or_else(|| "Player".into())
+}
+
+fn show_lobby(doc: &Document, lobby_visible: bool) {
+    if let Some(el) = doc.get_element_by_id("lobby") {
+        if lobby_visible {
+            el.remove_attribute("hidden").ok();
+        } else {
+            el.set_attribute("hidden", "").ok();
+        }
+    }
+    if let Some(el) = doc.get_element_by_id("game") {
+        if lobby_visible {
+            el.set_attribute("hidden", "").ok();
+        } else {
+            el.remove_attribute("hidden").ok();
+        }
+    }
+}
+
+fn set_status(doc: &Document, msg: &str) {
+    if let Some(el) = doc.get_element_by_id("status") {
+        el.set_text_content(Some(msg));
+    }
+}
+
+fn populate_map_options(doc: &Document, names: &[String]) {
+    let Some(sel) = doc
+        .get_element_by_id("new-room-map")
+        .and_then(|el| el.dyn_into::<HtmlSelectElement>().ok())
+    else {
+        return;
+    };
+    sel.set_inner_html("");
+    for name in names {
+        if let Ok(opt) = doc.create_element("option") {
+            opt.set_attribute("value", name).ok();
+            opt.set_text_content(Some(name));
+            let _ = sel.append_child(&opt);
+        }
+    }
+}
+
+fn render_room_list(doc: &Document, rooms: &[RoomSummary]) {
+    let Some(body) = doc.get_element_by_id("room-list-body") else {
+        return;
+    };
+    if rooms.is_empty() {
+        body.set_inner_html(
+            "<tr><td colspan=\"4\" class=\"empty\">no rooms — quick join will create one</td></tr>",
+        );
+        return;
+    }
+    let mut html = String::new();
+    for r in rooms {
+        let full = r.player_count >= r.cap;
+        let count_class = if full { " class=\"full\"" } else { "" };
+        let btn = if full {
+            "<button disabled>full</button>".to_string()
+        } else {
+            format!(
+                "<button class=\"join-btn\" data-room-id=\"{}\">Join</button>",
+                r.room_id
+            )
+        };
+        html.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td{}>{} / {}</td><td>{}</td></tr>",
+            html_escape(&r.name),
+            html_escape(&r.map_name),
+            count_class,
+            r.player_count,
+            r.cap,
+            btn
+        ));
+    }
+    body.set_inner_html(&html);
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn install_lobby_handlers(
+    doc: &Document,
+    app: Rc<RefCell<Option<App>>>,
+) -> Result<(), JsValue> {
+    // Each lobby action re-syncs the current value of #player-name to the
+    // server before sending the action — without this, the name typed after
+    // the WS opened never reaches the server (Hello captured the default
+    // "Player" at connect time).
+    let send_msg_with_name = {
+        let app = app.clone();
+        let doc = doc.clone();
+        move |msg: ClientMessage| {
+            let guard = app.borrow();
+            let Some(a) = guard.as_ref() else { return };
+            let name = read_player_name(&doc);
+            a.transport.send(&ClientMessage::SetName { name });
+            a.transport.send(&msg);
+        }
+    };
+
+    // Quick Join → JoinRoom { room_id: None }
+    if let Some(btn) = doc
+        .get_element_by_id("quick-join")
+        .and_then(|el| el.dyn_into::<HtmlButtonElement>().ok())
+    {
+        let send = send_msg_with_name.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            send(ClientMessage::JoinRoom { room_id: None });
+        });
+        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+        cb.forget();
+    }
+
+    // Refresh → ListRooms (no name sync needed — server doesn't display
+    // names in the lobby list)
+    if let Some(btn) = doc
+        .get_element_by_id("refresh")
+        .and_then(|el| el.dyn_into::<HtmlButtonElement>().ok())
+    {
+        let app2 = app.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            let guard = app2.borrow();
+            if let Some(a) = guard.as_ref() {
+                a.transport.send(&ClientMessage::ListRooms);
+            }
+        });
+        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+        cb.forget();
+    }
+
+    // Create Room → CreateRoom { name, map_name, bot_count }
+    if let Some(btn) = doc
+        .get_element_by_id("create-room")
+        .and_then(|el| el.dyn_into::<HtmlButtonElement>().ok())
+    {
+        let send = send_msg_with_name.clone();
+        let doc_for_cb = doc.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            let name = doc_for_cb
+                .get_element_by_id("new-room-name")
+                .and_then(|el| el.dyn_into::<HtmlInputElement>().ok())
+                .map(|el| el.value().trim().to_string())
+                .unwrap_or_default();
+            let map_name = doc_for_cb
+                .get_element_by_id("new-room-map")
+                .and_then(|el| el.dyn_into::<HtmlSelectElement>().ok())
+                .map(|el| el.value())
+                .unwrap_or_default();
+            let bot_count = doc_for_cb
+                .get_element_by_id("new-room-bots")
+                .and_then(|el| el.dyn_into::<HtmlInputElement>().ok())
+                .map(|el| el.value())
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(4)
+                .min(8);
+            if name.is_empty() {
+                set_status(&doc_for_cb, "room name required");
+                return;
+            }
+            if map_name.is_empty() {
+                set_status(&doc_for_cb, "pick a map");
+                return;
+            }
+            set_status(&doc_for_cb, "");
+            send(ClientMessage::CreateRoom { name, map_name, bot_count });
+        });
+        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+        cb.forget();
+    }
+
+    // Per-row Join button is delegated through the table body — buttons are
+    // recreated each render so binding individual handlers would leak.
+    if let Some(tbody) = doc.get_element_by_id("room-list-body") {
+        let send = send_msg_with_name;
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |ev: web_sys::Event| {
+            let Some(target) = ev.target() else { return };
+            let Some(el) = target.dyn_ref::<web_sys::Element>() else { return };
+            if !el.class_list().contains("join-btn") {
+                return;
+            }
+            let Some(rid_str) = el.get_attribute("data-room-id") else { return };
+            let Ok(room_id) = rid_str.parse::<u32>() else { return };
+            send(ClientMessage::JoinRoom { room_id: Some(room_id) });
+        });
+        tbody.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+        cb.forget();
+    }
     Ok(())
 }
 
@@ -221,10 +435,36 @@ fn clear_and_notify_server(app_cell: &Rc<RefCell<Option<App>>>) {
 }
 
 fn handle_server_message(app: &mut App, msg: ServerMessage) {
+    let doc = web_sys::window().and_then(|w| w.document());
     match msg {
-        ServerMessage::Welcome { player_id, server_tick } => {
-            log::info!("welcome: pid={} server_tick={}", player_id, server_tick);
-            app.status = "joining…".into();
+        ServerMessage::Welcome {
+            player_id,
+            server_tick,
+            protocol_version,
+        } => {
+            log::info!(
+                "welcome: pid={} server_tick={} server_proto={}",
+                player_id,
+                server_tick,
+                protocol_version
+            );
+            app.status = "in lobby".into();
+            if let Some(d) = &doc {
+                set_status(d, "");
+            }
+        }
+        ServerMessage::AvailableMaps { names } => {
+            log::info!("available maps: {:?}", names);
+            app.available_maps = names.clone();
+            if let Some(d) = &doc {
+                populate_map_options(d, &names);
+            }
+        }
+        ServerMessage::RoomList { rooms } => {
+            log::debug!("room list: {} rooms", rooms.len());
+            if let Some(d) = &doc {
+                render_room_list(d, &rooms);
+            }
         }
         ServerMessage::JoinedRoom { room_id, map, players, your_ship_id } => {
             log::info!(
@@ -234,9 +474,9 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                 players.len()
             );
             let world = World::new(map);
-            let radar_walls = web_sys::window()
-                .and_then(|w| w.document())
-                .and_then(|doc| render::build_radar_walls(&doc, &world.map));
+            let radar_walls = doc
+                .as_ref()
+                .and_then(|d| render::build_radar_walls(d, &world.map));
             app.game = Some(GameView {
                 world,
                 local_ship: your_ship_id,
@@ -251,6 +491,9 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             app.unacked_inputs.clear();
             app.local_tick = 0;
             app.status = String::new();
+            if let Some(d) = &doc {
+                show_lobby(d, false);
+            }
         }
         ServerMessage::PlayerJoined(p) => {
             log::info!("player joined: {} ({})", p.name, p.player_id);
@@ -327,6 +570,9 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
         ServerMessage::Error { message } => {
             log::error!("server error: {}", message);
             app.status = format!("server error: {}", message);
+            if let Some(d) = &doc {
+                set_status(d, &message);
+            }
         }
         ServerMessage::RtcOffer { .. }
         | ServerMessage::RtcAnswer { .. }
@@ -481,6 +727,15 @@ fn rebuild_render_world(g: &mut GameView, now_ms: f64) {
     world.particles = particles;
     world.tick = ts.snap.server_tick;
 
+    // Sync cannon alive flags from the server. The client doesn't simulate
+    // cannons; without this, every cannon would render as alive forever even
+    // after the server killed it. `dead_cannons` is empty when all alive.
+    let dead: std::collections::BTreeSet<(u32, u32)> =
+        ts.snap.dead_cannons.iter().copied().collect();
+    for (cell, cannon) in world.cannons.iter_mut() {
+        cannon.alive = !dead.contains(cell);
+    }
+
     if let Some(local) = predicted_local_ship.clone() {
         world.ships.insert(local_id, local);
     }
@@ -523,7 +778,7 @@ fn do_local_tick(app: &mut App) {
 
     if let Some(ship) = g.predicted_local_ship.as_mut() {
         apply_ship_dynamics(ship, &input, &g.world.map);
-        if let Some(nb) = try_fire(ship, &input) {
+        if let Some(nb) = try_fire(ship, &input, &g.world.map) {
             g.predicted_local_bullets.push(Bullet {
                 entity_id: 0,
                 shooter: nb.shooter,
@@ -560,8 +815,15 @@ fn do_local_tick(app: &mut App) {
         }
     }
 
-    g.predicted_local_bullets
-        .retain_mut(|b| !step_bullet(b, &g.world.map));
+    g.predicted_local_bullets.retain_mut(|b| {
+        if step_bullet(b, &g.world.map) {
+            return false;
+        }
+        if g.world.map.edge_wrap {
+            b.pos = wrap_pos(b.pos, g.world.map.width, g.world.map.height);
+        }
+        true
+    });
 
     app.local_tick = app.local_tick.wrapping_add(1);
 }

@@ -17,6 +17,12 @@ pub struct SpawnPoint {
 
 /// Single-cell map element. The four `Tri*` variants are XPilot's slope
 /// blocks — the suffix names the corner that's *filled* (UL = upper-left, etc).
+/// `Cannon*` variants are OPEN cells (not walls) that emit a spawn point at
+/// the cell center facing the named direction. Visually rendered as a single
+/// white line along the opposite cell edge — the line acts as the "back
+/// wall" the ship rests against, with its perpendicular giving the facing
+/// direction. (Classic XPilot's r/c/d/f cannons, repurposed as oriented
+/// spawns.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Block {
@@ -31,6 +37,19 @@ pub enum Block {
     /// `q` — filled lower-right, hypotenuse upper-right ↔ lower-left.
     TriLR = 5,
     Base = 6,
+    CannonUp = 7,
+    CannonDown = 8,
+    CannonLeft = 9,
+    CannonRight = 10,
+    /// Active cannon — full wall block that fires periodically in the named
+    /// direction and can be destroyed. Respawns after `CANNON_RESPAWN_SECONDS`.
+    /// Distinct from the `Cannon*` (lowercase r/c/d/f) spawn-direction
+    /// markers above; these (uppercase R/C/D/F in the .xp grid) are the real
+    /// classic-XPilot turret.
+    CannonFireUp = 11,
+    CannonFireDown = 12,
+    CannonFireLeft = 13,
+    CannonFireRight = 14,
 }
 
 impl Block {
@@ -42,6 +61,14 @@ impl Block {
             4 => Block::TriLL,
             5 => Block::TriLR,
             6 => Block::Base,
+            7 => Block::CannonUp,
+            8 => Block::CannonDown,
+            9 => Block::CannonLeft,
+            10 => Block::CannonRight,
+            11 => Block::CannonFireUp,
+            12 => Block::CannonFireDown,
+            13 => Block::CannonFireLeft,
+            14 => Block::CannonFireRight,
             _ => Block::Space,
         }
     }
@@ -49,20 +76,91 @@ impl Block {
     pub fn is_wall(self) -> bool {
         matches!(
             self,
-            Block::Wall | Block::TriUL | Block::TriUR | Block::TriLL | Block::TriLR
+            Block::Wall
+                | Block::TriUL
+                | Block::TriUR
+                | Block::TriLL
+                | Block::TriLR
+                | Block::CannonFireUp
+                | Block::CannonFireDown
+                | Block::CannonFireLeft
+                | Block::CannonFireRight
         )
     }
     pub fn has_top(self) -> bool {
-        matches!(self, Block::Wall | Block::TriUL | Block::TriUR)
+        matches!(
+            self,
+            Block::Wall
+                | Block::TriUL
+                | Block::TriUR
+                | Block::CannonFireUp
+                | Block::CannonFireDown
+                | Block::CannonFireLeft
+                | Block::CannonFireRight
+        )
     }
     pub fn has_bottom(self) -> bool {
-        matches!(self, Block::Wall | Block::TriLL | Block::TriLR)
+        matches!(
+            self,
+            Block::Wall
+                | Block::TriLL
+                | Block::TriLR
+                | Block::CannonFireUp
+                | Block::CannonFireDown
+                | Block::CannonFireLeft
+                | Block::CannonFireRight
+        )
     }
     pub fn has_left(self) -> bool {
-        matches!(self, Block::Wall | Block::TriUL | Block::TriLL)
+        matches!(
+            self,
+            Block::Wall
+                | Block::TriUL
+                | Block::TriLL
+                | Block::CannonFireUp
+                | Block::CannonFireDown
+                | Block::CannonFireLeft
+                | Block::CannonFireRight
+        )
     }
     pub fn has_right(self) -> bool {
-        matches!(self, Block::Wall | Block::TriUR | Block::TriLR)
+        matches!(
+            self,
+            Block::Wall
+                | Block::TriUR
+                | Block::TriLR
+                | Block::CannonFireUp
+                | Block::CannonFireDown
+                | Block::CannonFireLeft
+                | Block::CannonFireRight
+        )
+    }
+
+    /// For a cannon block, the spawn-point direction (engine angle) — the
+    /// ship spawns at the cell's center. None for non-cannons.
+    /// Engine convention: angle 0 = up (-y), π/2 = right, π = down, -π/2 = left.
+    pub fn cannon_angle(self) -> Option<f32> {
+        use core::f32::consts::PI;
+        match self {
+            Block::CannonUp => Some(0.0),
+            Block::CannonRight => Some(PI * 0.5),
+            Block::CannonDown => Some(PI),
+            Block::CannonLeft => Some(-PI * 0.5),
+            _ => None,
+        }
+    }
+
+    /// For an active cannon, the firing direction (engine angle) and the
+    /// unit vector pointing in that direction. None for non-cannons.
+    pub fn cannon_fire(self) -> Option<(f32, Vec2)> {
+        use core::f32::consts::PI;
+        match self {
+            Block::CannonFireUp => Some((0.0, Vec2::new(0.0, -1.0))),
+            Block::CannonFireRight => Some((PI * 0.5, Vec2::new(1.0, 0.0))),
+            Block::CannonFireDown => Some((PI, Vec2::new(0.0, 1.0))),
+            Block::CannonFireLeft => Some((-PI * 0.5, Vec2::new(-1.0, 0.0))),
+            _ => None,
+        }
     }
 }
 
