@@ -1,0 +1,33 @@
+[Unit]
+Description=xpilot.io game server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xpilot
+Group=xpilot
+WorkingDirectory=/opt/xpilot
+ExecStart=/opt/xpilot/server
+Restart=on-failure
+RestartSec=2
+Environment="RUST_LOG=info,server=info,webrtc_ice=warn,webrtc_mdns=warn"
+
+# Sandbox — the binary runs as a non-login user and only needs to read its
+# own dir. systemd makes the rest of the FS read-only / inaccessible.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/opt/xpilot
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+
+[Install]
+WantedBy=multi-user.target

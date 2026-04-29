@@ -377,8 +377,17 @@ fn install_lobby_handlers(
 
 fn ws_url(window: &web_sys::Window) -> Result<String, JsValue> {
     let loc = window.location();
-    let host = loc.hostname().unwrap_or_else(|_| "localhost".to_string());
-    Ok(format!("ws://{}:8080/ws", host))
+    let proto = loc.protocol().unwrap_or_else(|_| "http:".into());
+    // Production (https): connect to the same host on /ws — Caddy reverse-
+    // proxies the WebSocket upgrade to the game server on localhost:8080.
+    // Local dev (http): connect directly to the game server on :8080.
+    if proto == "https:" {
+        let host = loc.host().unwrap_or_else(|_| "localhost".into());
+        Ok(format!("wss://{}/ws", host))
+    } else {
+        let host = loc.hostname().unwrap_or_else(|_| "localhost".into());
+        Ok(format!("ws://{}:8080/ws", host))
+    }
 }
 
 fn perf_now() -> f64 {

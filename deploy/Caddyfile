@@ -1,0 +1,13 @@
+# xpilot.io — apex serves the wasm client + proxies /ws to game server.
+xpilot.io {
+    encode zstd gzip
+    root * /var/www/xpilot
+    # WebSocket upgrade for the game server. Match /ws and any /ws/* path.
+    reverse_proxy /ws* localhost:8080
+    file_server
+}
+
+# www → bare apex
+www.xpilot.io {
+    redir https://xpilot.io{uri} permanent
+}
