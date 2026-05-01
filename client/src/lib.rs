@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
 use shared::constants::{
-    BULLET_MASS, SHIP_RESPAWN_SECONDS, TICK_DT_SECONDS, WASH_CONE_HALF_ANGLE_RAD,
-    WASH_CONE_LENGTH, WASH_FORCE_AT_MOUTH,
+    BULLET_COOLDOWN_SECONDS, BULLET_MASS, SHIP_RESPAWN_SECONDS, TICK_DT_SECONDS,
+    WASH_CONE_HALF_ANGLE_RAD, WASH_CONE_LENGTH, WASH_FORCE_AT_MOUTH,
 };
 use shared::entities::{forward, Bullet, EntityId, Ship};
 use shared::math::Vec2;
@@ -93,6 +93,18 @@ struct App {
     /// to 0 on each death. The Elm version had `lifeKills` for this but
     /// commented out the on-screen display — re-adding here per request.
     kill_streak: u32,
+    /// Our own PlayerId, captured from the `Welcome` message. Cached so we
+    /// can identify "did I die" / "did I kill" on `ShipDied` events even
+    /// when the snapshot omits our ship (i.e. between death and respawn,
+    /// which is exactly when streak-reset matters).
+    local_player_id: Option<shared::entities::PlayerId>,
+    /// `local_tick` at which we last pushed a predicted bullet. Used to
+    /// enforce cooldown at the prediction layer, independent of the ship's
+    /// own `fire_cooldown` field — reconcile from a snapshot whose server
+    /// view of the ship has cooldown=0 (e.g. shortly after respawn auto-
+    /// fire decays) can otherwise let `do_local_tick` push a second
+    /// predicted bullet inside the cooldown window of the first.
+    last_predicted_fire_tick: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -215,6 +227,8 @@ pub fn start() -> Result<(), JsValue> {
         selected_player_id: None,
         personal_kills: VecDeque::with_capacity(8),
         kill_streak: 0,
+        local_player_id: None,
+        last_predicted_fire_tick: None,
     });
 
     load_saved_name(&window, &document);
@@ -1028,6 +1042,7 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                 server_tick,
                 protocol_version
             );
+            app.local_player_id = Some(player_id);
             app.status = "in lobby".into();
             if let Some(d) = &doc {
                 set_status(d, "");
@@ -1098,7 +1113,21 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                 radar_walls,
             });
             app.unacked_inputs.clear();
-            app.local_tick = 0;
+            // Intentionally do NOT reset `local_tick`. The server's
+            // `last_input_tick` only ever advances and persists across stale
+            // in-flight inputs from a previous room: when you switch rooms,
+            // inputs you sent before the switch (with high client_ticks) can
+            // arrive at the new room's player struct AFTER it's registered,
+            // pushing `last_input_tick` to those high values. If we then
+            // restart `local_tick` from 0, every input we send for a long
+            // while looks "already processed" to the server, the snapshot's
+            // `your_last_processed_input` is way ahead of our actual ticks,
+            // and reconcile trims our entire `unacked_inputs` queue every
+            // snapshot. With nothing left to replay, predicted ship snaps
+            // back to the server's view (cooldown=0, charge=MAX) every
+            // frame, defeating the cooldown gate and making `do_local_tick`
+            // fire a predicted bullet on every single tick — that's the
+            // first-shot cluster bug.
             app.status = String::new();
             if let Some(d) = &doc {
                 // First join of the session: leave the lobby up so the player
@@ -1127,6 +1156,18 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
         ServerMessage::Snapshot(snap) => {
             let Some(g) = app.game.as_mut() else { return };
 
+            // Out-of-order arrivals over the unreliable datachannel: drop
+            // anything older than what we already have BEFORE touching any
+            // state. If we trim unacked_inputs or re-anchor the predicted
+            // ship from a stale snapshot, the replay loop is missing the
+            // inputs between the older snapshot's tick and the newer one's,
+            // and the predicted ship jumps to a wrong (older) position.
+            if let Some(prev) = &g.latest_snapshot {
+                if snap.server_tick <= prev.snap.server_tick {
+                    return;
+                }
+            }
+
             // Drop unacked inputs the server has now processed.
             while let Some(front) = app.unacked_inputs.front() {
                 if front.client_tick <= snap.your_last_processed_input {
@@ -1138,6 +1179,7 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
 
             // Re-anchor predicted local ship from the snapshot, then replay
             // unacked inputs to advance it back to "now".
+            let was_dead = g.predicted_local_ship.is_none();
             let local_in_snap = snap
                 .ships
                 .iter()
@@ -1148,20 +1190,35 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                     apply_ship_dynamics(&mut local, input, &g.world.map);
                 }
                 g.predicted_local_ship = Some(local);
-                // Respawned (or first spawn): clear death-state UI.
                 g.death_camera_pos = None;
                 g.death_time_ms = None;
+                if was_dead {
+                    // Reset the prediction-layer fire-cooldown gate so the
+                    // very first post-respawn shot is allowed.
+                    app.last_predicted_fire_tick = None;
+                    // Respawn transition. Two pieces of cleanup:
+                    //
+                    // 1. Clear leftover predicted bullets from the previous
+                    //    life (lifetime 2.5s > respawn 2.0s, so on wrapping
+                    //    maps they can drift back to the spawn).
+                    // 2. Drop any catch-up time accumulated during the
+                    //    pre-spawn stall (heavy `JoinedRoom` work like map
+                    //    setup + `build_radar_walls` blocks RAF for 100-300ms
+                    //    on big maps). Without this, the first frame after
+                    //    spawn multi-steps 10-15 ticks at once. With fire
+                    //    held, the cooldown gate only blocks ~9 ticks, so
+                    //    we'd fire 2-3 predicted bullets in that single
+                    //    burst — visible as a cluster shooting out the
+                    //    muzzle on the first shot. Server only fires one
+                    //    (it hasn't multi-stepped) so the energy bar
+                    //    correctly shows one shot's depletion.
+                    g.predicted_local_bullets.clear();
+                    app.accumulator = 0.0;
+                }
             } else {
                 g.predicted_local_ship = None;
             }
 
-            // Out-of-order arrivals (possible once we move to UDP-ish
-            // datachannels): drop anything older than what we already have.
-            if let Some(prev) = &g.latest_snapshot {
-                if snap.server_tick <= prev.snap.server_tick {
-                    return;
-                }
-            }
             g.latest_snapshot = Some(TimedSnapshot {
                 snap,
                 arrival_ms: perf_now(),
@@ -1189,17 +1246,11 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                 let killer_is_bot = killer.map(|k| lookup_is_bot(app, k));
                 let victim_name = lookup_player_name(app, victim_player_id);
                 let killer_name = killer.map(|k| lookup_player_name(app, k));
-                let local_pid = app.game.as_ref().and_then(|g| {
-                    g.latest_snapshot
-                        .as_ref()
-                        .and_then(|ts| {
-                            ts.snap
-                                .ships
-                                .iter()
-                                .find(|sh| sh.entity_id == g.local_ship)
-                        })
-                        .map(|sh| sh.player_id)
-                });
+                // Use the cached PlayerId from `Welcome`, not a snapshot
+                // lookup — when WE die our ship is removed from snapshots,
+                // so a snapshot-derived id would be `None` exactly when we
+                // need it most (to reset our kill streak).
+                let local_pid = app.local_player_id;
 
                 // Human-involved filter: human victim OR (human killer AND
                 // killer != victim, so suicides count as one party).
@@ -1354,9 +1405,7 @@ fn frame(app_cell: &Rc<RefCell<Option<App>>>, timestamp_ms: f64) {
         let newest = g.latest_snapshot.as_ref().map(|t| &t.snap);
         let players: Vec<_> = newest.map(|s| s.players.clone()).unwrap_or_default();
         let local_alive = alive_pos.is_some();
-        let local_pid = newest
-            .and_then(|s| s.ships.iter().find(|sh| sh.entity_id == g.local_ship))
-            .map(|sh| sh.player_id);
+        let local_pid = app.local_player_id;
         let local_charge = g.predicted_local_ship.as_ref().map(|s| s.shot_charge);
         // Respawn countdown: how much real time is left. None when alive.
         let respawn_in = g.death_time_ms.map(|t| {
@@ -1521,16 +1570,31 @@ fn do_local_tick(app: &mut App) {
     if let Some(ship) = g.predicted_local_ship.as_mut() {
         apply_ship_dynamics(ship, &input, &g.world.map);
         if let Some(nb) = try_fire(ship, &input, &g.world.map) {
-            g.predicted_local_bullets.push(Bullet {
-                entity_id: 0,
-                shooter: nb.shooter,
-                pos: nb.pos,
-                vel: nb.vel,
-                mass: BULLET_MASS,
-                age_seconds: 0.0,
-            });
-            while g.predicted_local_bullets.len() > MAX_PREDICTED_BULLETS {
-                g.predicted_local_bullets.remove(0);
+            // Prediction-layer cooldown gate, in addition to the ship's
+            // `fire_cooldown` (which `apply_ship_dynamics`/`try_fire`
+            // already consult). This one's authoritative against reconcile-
+            // driven cooldown resets: even if a snapshot reset the ship to
+            // cooldown=0, we won't push a second predicted bullet within
+            // one cooldown window of the previous one.
+            const PREDICTED_COOLDOWN_TICKS: u32 =
+                (BULLET_COOLDOWN_SECONDS / TICK_DT_SECONDS) as u32;
+            let allowed = match app.last_predicted_fire_tick {
+                None => true,
+                Some(t) => app.local_tick.wrapping_sub(t) >= PREDICTED_COOLDOWN_TICKS,
+            };
+            if allowed {
+                g.predicted_local_bullets.push(Bullet {
+                    entity_id: 0,
+                    shooter: nb.shooter,
+                    pos: nb.pos,
+                    vel: nb.vel,
+                    mass: BULLET_MASS,
+                    age_seconds: 0.0,
+                });
+                while g.predicted_local_bullets.len() > MAX_PREDICTED_BULLETS {
+                    g.predicted_local_bullets.remove(0);
+                }
+                app.last_predicted_fire_tick = Some(app.local_tick);
             }
         }
     }
