@@ -47,6 +47,9 @@ pub struct PlayerInfo {
     pub deaths: u32,
     /// `true` while the player is in the respawn timer.
     pub dead: bool,
+    /// `true` for server-spawned bot players (Sid, Cobra, etc.). Clients
+    /// decorate these names so humans can tell who's a bot at a glance.
+    pub is_bot: bool,
 }
 
 /// Summary of a room shown in the lobby's room list. Cheap to compute and
@@ -88,6 +91,13 @@ pub enum GameEvent {
         shooter: PlayerId,
         victim: PlayerId,
         damage: u32,
+    },
+    /// Chat message broadcast to everyone in the room. Author looked up by
+    /// `player_id` against the most recent PlayerInfo on the client side —
+    /// no need to bake the name into every chat event.
+    Chat {
+        player_id: PlayerId,
+        text: String,
     },
 }
 
@@ -143,6 +153,21 @@ pub enum ClientMessage {
     },
     /// Per-tick input. Sent unreliably (when WebRTC is wired up in M6).
     Input(TickInput),
+    /// Reports the visible-world rectangle around the player's ship in world
+    /// units. Server uses it (plus AOI_MARGIN) to filter bullets/particles
+    /// out of snapshots that aren't visible to this player. Sent reliably:
+    /// the value is sticky on the server until the next one arrives. Send
+    /// after JoinedRoom and again whenever the canvas/zoom changes (debounce
+    /// rapid changes — e.g. mobile pinch-zoom — client-side).
+    Viewport {
+        half_width: f32,
+        half_height: f32,
+    },
+    /// Free-text chat from the player. Server validates length + trims, then
+    /// rebroadcasts as `GameEvent::Chat` to everyone in the room. Reliable.
+    Chat {
+        text: String,
+    },
     Leave,
     /// WebRTC signaling — stub for M6.
     RtcOffer { sdp: String },

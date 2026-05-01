@@ -5,47 +5,160 @@
     <title>xpilot.io</title>
     <link data-trunk rel="rust" data-wasm-opt="z" />
     <style>
+      /* Classic XPilot palette: black bg, blue walls/borders, red highlights,
+         white/cyan text. The lobby is the loudest piece so most accents live
+         here; in-game HUD inherits the same colors via the canvas renderer. */
       html, body {
         margin: 0;
         padding: 0;
         background: #000;
-        color: #cfc;
+        color: #ddd;
         font-family: monospace;
       }
       #game { display: block; margin: 0 auto; background: #000; }
       #game[hidden] { display: none; }
 
+      /* Backdrop catches click-outside-to-close and lightly dims the game
+         behind. Kept faint so the gameplay underneath stays visible — the
+         lobby itself is also semi-transparent so the world peeks through it. */
+      #lobby-backdrop {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.25);
+        z-index: 9;
+      }
+      #lobby-backdrop[hidden] { display: none; }
+
       #lobby {
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 10;
         max-width: 720px;
-        margin: 40px auto;
+        width: calc(100% - 40px);
+        max-height: calc(100vh - 40px);
+        overflow-y: auto;
+        /* ~80% opaque dark blue — readable but you can still see ships/bullets
+           through it. Border is xpilot wall blue. */
+        background: rgba(0, 8, 24, 0.82);
         padding: 24px;
-        border: 1px solid #2a4;
+        border: 1px solid #44a;
+        box-sizing: border-box;
+        text-align: center;
       }
       #lobby[hidden] { display: none; }
-      #lobby h1 { margin: 0 0 8px 0; font-size: 28px; color: #5f5; }
-      #lobby h2 { margin: 24px 0 8px 0; font-size: 16px; color: #9f9; }
-      #lobby .row { margin: 12px 0; display: flex; gap: 8px; align-items: center; }
-      #lobby label { min-width: 90px; }
+      #lobby h2 {
+        margin: 24px 0 8px 0;
+        font-size: 16px;
+        color: #6cf;
+        letter-spacing: 2px;
+      }
+      #lobby .row {
+        margin: 12px 0;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        text-align: left;
+      }
+      #lobby label { min-width: 90px; color: #aaf; }
       #lobby input, #lobby select {
-        background: #021;
-        color: #cfc;
-        border: 1px solid #2a4;
+        background: #000;
+        color: #fff;
+        border: 1px solid #44a;
         padding: 6px 8px;
         font-family: inherit;
         font-size: 14px;
         flex: 1;
       }
       #lobby button {
-        background: #042;
-        color: #cfc;
-        border: 1px solid #4c8;
+        background: #114;
+        color: #fff;
+        border: 1px solid #66c;
         padding: 6px 14px;
         font-family: inherit;
         font-size: 14px;
         cursor: pointer;
       }
-      #lobby button:hover { background: #063; }
+      #lobby button:hover { background: #226; border-color: #88e; }
       #lobby button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+      /* XPILOT banner — block ASCII letters in classic xpilot red. The font
+         size is tied to viewport width so it scales down on phones rather
+         than overflowing. line-height 1.0 keeps the letterforms tight. */
+      #logo {
+        margin: 0 auto;
+        color: #f44;
+        font-family: monospace;
+        font-weight: bold;
+        font-size: clamp(7px, 1.6vw, 13px);
+        line-height: 1.0;
+        text-shadow: 0 0 6px rgba(255, 64, 64, 0.5);
+        white-space: pre;
+        display: inline-block;
+        text-align: left;
+      }
+      #welcome {
+        color: #6cf;
+        font-size: 14px;
+        margin: 8px 0 4px 0;
+        letter-spacing: 3px;
+      }
+
+      /* Close X — only shown when the lobby is dismissible (i.e. there's a
+         game running behind it). Hidden during the very first connect. */
+      #lobby-close {
+        position: absolute;
+        top: 8px;
+        right: 12px;
+        background: none;
+        border: none;
+        color: #fff;
+        font-size: 22px;
+        cursor: pointer;
+        padding: 2px 8px;
+        line-height: 1;
+      }
+      #lobby-close:hover { color: #f44; }
+      #lobby-close[hidden] { display: none; }
+
+      /* Top-left in-game button to bring the lobby back up. Mirrors what
+         Escape does. */
+      #rooms-btn {
+        position: fixed;
+        top: 10px;
+        left: 10px;
+        z-index: 8;
+        background: #114;
+        color: #fff;
+        border: 1px solid #66c;
+        padding: 6px 12px;
+        font-family: monospace;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      #rooms-btn:hover { background: #226; border-color: #88e; }
+      #rooms-btn[hidden] { display: none; }
+
+      /* Chat compose box. Hidden by default; M key opens + focuses, Enter
+         sends, Escape cancels. Sits above the canvas, below the lobby. */
+      #chat-input {
+        position: fixed;
+        top: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 7;
+        width: 600px;
+        max-width: calc(100vw - 40px);
+        background: #000;
+        color: #fff;
+        border: 1px solid #66c;
+        padding: 8px 12px;
+        font-family: monospace;
+        font-size: 14px;
+        box-sizing: border-box;
+      }
+      #chat-input[hidden] { display: none; }
 
       #room-list {
         width: 100%;
@@ -55,19 +168,27 @@
       #room-list th, #room-list td {
         text-align: left;
         padding: 6px 8px;
-        border-bottom: 1px solid #163;
+        border-bottom: 1px solid #226;
       }
-      #room-list th { color: #9f9; font-weight: normal; }
-      #room-list .empty { color: #686; font-style: italic; padding: 12px 8px; }
-      #room-list .full { color: #d66; }
+      #room-list th { color: #6cf; font-weight: normal; }
+      #room-list .empty { color: #557; font-style: italic; padding: 12px 8px; }
+      #room-list .full { color: #f55; }
 
       #status { margin-top: 16px; min-height: 1.2em; color: #fc6; }
-      .hint { color: #686; font-size: 12px; }
+      .hint { color: #557; font-size: 12px; margin-top: 8px; }
     </style>
   </head>
   <body>
-    <div id="lobby" hidden>
-      <h1>xpilot.io</h1>
+    <div id="lobby-backdrop" hidden></div>
+    <div id="lobby">
+      <button id="lobby-close" hidden aria-label="close">&times;</button>
+<pre id="logo"> ██╗  ██╗██████╗ ██╗██╗      ██████╗ ████████╗
+ ╚██╗██╔╝██╔══██╗██║██║     ██╔═══██╗╚══██╔══╝
+  ╚███╔╝ ██████╔╝██║██║     ██║   ██║   ██║
+  ██╔██╗ ██╔═══╝ ██║██║     ██║   ██║   ██║
+ ██╔╝ ██╗██║     ██║███████╗╚██████╔╝   ██║
+ ╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝ ╚═════╝    ╚═╝   </pre>
+      <div id="welcome">welcome to xpilot!</div>
       <div class="row">
         <label for="player-name">Name</label>
         <input id="player-name" maxlength="20" value="Player" />
@@ -106,10 +227,12 @@
         <input id="new-room-bots" type="number" min="0" max="8" value="4" style="flex: 0 0 80px;" />
         <button id="create-room">Create</button>
       </div>
-      <div class="hint">controls: A/S turn, Shift thrust, Space fire</div>
+      <div class="hint">controls: A/S turn, Shift thrust, Space fire, M chat, Esc rooms</div>
       <div id="status"></div>
     </div>
 
     <canvas id="game" width="1200" height="700" hidden></canvas>
+    <button id="rooms-btn" hidden>Rooms</button>
+    <input id="chat-input" hidden maxlength="200" placeholder="say something — Enter to send, Esc to cancel" />
   </body>
 </html>

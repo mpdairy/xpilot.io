@@ -14,6 +14,21 @@ use crate::particles::ParticleField;
 const RADAR_MAX: f64 = 200.0;
 const RADAR_PAD: f64 = 10.0;
 
+/// One chat message in the on-screen log. Fades after a few seconds; the
+/// owner (lib.rs) caps the queue length.
+pub struct ChatLine {
+    pub author: String,
+    pub text: String,
+    /// `performance.now()` ms when this landed.
+    pub t_ms: f64,
+}
+
+/// Display schedule for chat lines: full alpha for `CHAT_VISIBLE_MS`, then
+/// linear fade over `CHAT_FADE_MS`, then dropped from the on-screen log
+/// (the queue itself is dropped on push when over cap, separately).
+const CHAT_VISIBLE_MS: f64 = 6_000.0;
+const CHAT_FADE_MS: f64 = 2_000.0;
+
 pub struct Camera {
     pub center: Vec2,
     pub viewport: Vec2,
@@ -73,6 +88,8 @@ pub fn render(
     local_shot_charge: Option<f32>,
     respawn_remaining_seconds: Option<f32>,
     radar_walls: Option<&HtmlCanvasElement>,
+    chat_log: &std::collections::VecDeque<ChatLine>,
+    now_ms: f64,
 ) {
     let w = canvas.width() as f64;
     let h = canvas.height() as f64;
@@ -208,22 +225,22 @@ pub fn render(
     }
 
     // Ships. Other-player names rendered underneath in white — like the
-    // Elm version. Local player skipped (you know who you are).
+    // Elm version. Local player skipped (you know who you are). Bots get a
+    // " (R)" suffix in the label and a small red center dot on the ship.
     for ship in world.ships.values() {
         let is_me = local_player_id.map_or(false, |me| me == ship.player_id);
-        let name = if is_me {
+        let player = players.iter().find(|p| p.player_id == ship.player_id);
+        let is_bot = player.map(|p| p.is_bot).unwrap_or(false);
+        let name_string: Option<String> = if is_me {
             None
         } else {
-            players
-                .iter()
-                .find(|p| p.player_id == ship.player_id)
-                .map(|p| p.name.as_str())
+            player.map(display_name)
         };
-        draw_ship(ctx, &camera, ship, name);
+        draw_ship(ctx, &camera, ship, name_string.as_deref(), is_bot);
     }
 
     // Debug HUD.
-    ctx.set_fill_style_str("#0a0");
+    ctx.set_fill_style_str("#6cf");
     ctx.set_font("14px monospace");
     let _ = ctx.fill_text(
         &format!(
@@ -252,6 +269,70 @@ pub fn render(
     if let Some(t) = respawn_remaining_seconds {
         draw_respawn_countdown(ctx, w, h, t);
     }
+
+    draw_chat(ctx, w, chat_log, now_ms);
+}
+
+/// Stack chat lines top-center of the canvas, oldest fading first. Lines
+/// past their visible+fade window are skipped (the queue itself isn't
+/// pruned here — that happens in lib.rs when it overflows the cap).
+fn draw_chat(
+    ctx: &CanvasRenderingContext2d,
+    canvas_w: f64,
+    log: &std::collections::VecDeque<ChatLine>,
+    now_ms: f64,
+) {
+    if log.is_empty() {
+        return;
+    }
+    let line_h: f64 = 18.0;
+    let pad = 6.0;
+    let max_width = (canvas_w - 40.0).min(700.0);
+    // First-pass: collect lines with computed alpha (skip invisible ones).
+    let visible: Vec<(&ChatLine, f64)> = log
+        .iter()
+        .filter_map(|l| {
+            let age = now_ms - l.t_ms;
+            if age < CHAT_VISIBLE_MS {
+                Some((l, 1.0))
+            } else if age < CHAT_VISIBLE_MS + CHAT_FADE_MS {
+                let fade_phase = (age - CHAT_VISIBLE_MS) / CHAT_FADE_MS;
+                Some((l, 1.0 - fade_phase))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if visible.is_empty() {
+        return;
+    }
+    ctx.set_font("13px monospace");
+    ctx.set_text_align("left");
+    let mut y = 8.0 + line_h;
+    for (line, alpha) in &visible {
+        let text = format!("{}: {}", line.author, line.text);
+        // Cap width by truncating the message text only — keep the author
+        // visible. Cheap heuristic: 7.5 px per monospace char at 13px.
+        let max_chars = ((max_width - 2.0 * pad) / 7.5) as usize;
+        let display: String = text.chars().take(max_chars).collect();
+        // Measure and draw a translucent backdrop so chat stays readable
+        // against bright explosions.
+        let metrics_w = match ctx.measure_text(&display) {
+            Ok(m) => m.width(),
+            Err(_) => display.chars().count() as f64 * 7.5,
+        };
+        let bx = (canvas_w - metrics_w) * 0.5 - pad;
+        let by = y - line_h + 4.0;
+        ctx.set_global_alpha(0.45 * *alpha);
+        ctx.set_fill_style_str("#000");
+        ctx.fill_rect(bx, by, metrics_w + pad * 2.0, line_h);
+        ctx.set_global_alpha(*alpha);
+        ctx.set_fill_style_str("#fff");
+        let _ = ctx.fill_text(&display, bx + pad, y);
+        y += line_h;
+    }
+    ctx.set_global_alpha(1.0);
+    ctx.set_text_align("start");
 }
 
 fn draw_local_hud(ctx: &CanvasRenderingContext2d, canvas_w: f64, canvas_h: f64, charge: f32) {
@@ -402,19 +483,19 @@ fn draw_scoreboard(
     let pad = 8.0;
     let rows = players.len() + 1; // header + entries
     let height = pad * 2.0 + line_h * rows as f64;
-    let width = 220.0;
+    let width = 260.0;
     let x = canvas_w - width - 10.0;
     let y = 10.0;
 
     ctx.set_fill_style_str("rgba(0, 0, 0, 0.55)");
     ctx.fill_rect(x, y, width, height);
-    ctx.set_stroke_style_str("#0a0");
+    ctx.set_stroke_style_str("#44a");
     ctx.set_line_width(1.0);
     ctx.stroke_rect(x, y, width, height);
 
     ctx.set_font("13px monospace");
-    ctx.set_fill_style_str("#0c0");
-    let _ = ctx.fill_text("name           K   D", x + pad, y + pad + line_h - 3.0);
+    ctx.set_fill_style_str("#6cf");
+    let _ = ctx.fill_text("name               K   D", x + pad, y + pad + line_h - 3.0);
 
     let mut sorted: Vec<&PlayerInfo> = players.iter().collect();
     sorted.sort_by_key(|p| -(p.kills as i64 - p.deaths as i64));
@@ -430,13 +511,27 @@ fn draw_scoreboard(
             "#888"
         };
         ctx.set_fill_style_str(color);
-        let mut name = p.name.clone();
-        name.truncate(12);
+        let mut name = display_name(p);
+        // Cap at 16 chars rather than 12 so the " [bot]" suffix on a 10-char
+        // bot name still fits without surprise truncation. Scoreboard column
+        // widens to match.
+        name.truncate(16);
         let _ = ctx.fill_text(
-            &format!("{:<12}  {:>3} {:>3}", name, p.kills, p.deaths),
+            &format!("{:<16}  {:>3} {:>3}", name, p.kills, p.deaths),
             x + pad,
             row_y,
         );
+    }
+}
+
+/// Display name for a player, with a " (R)" suffix for server-spawned
+/// bots so humans can tell players apart at a glance. Short tag so it
+/// doesn't crowd the scoreboard column.
+fn display_name(p: &PlayerInfo) -> String {
+    if p.is_bot {
+        format!("{} (R)", p.name)
+    } else {
+        p.name.clone()
     }
 }
 
@@ -448,7 +543,9 @@ fn draw_respawn_countdown(ctx: &CanvasRenderingContext2d, w: f64, h: f64, remain
     let mid_x = w / 2.0;
     let mid_y = h / 2.0;
     let bottom = mid_y + hud_h / 2.0;
-    ctx.set_fill_style_str("#0c0");
+    // Match the local HUD's green so the countdown reads as part of the
+    // same widget rather than a separate alert.
+    ctx.set_fill_style_str("#070");
     ctx.set_font("11px monospace");
     let text = format!("{:.2}", remaining);
     let tw = ctx.measure_text(&text).map(|m| m.width()).unwrap_or(36.0);
@@ -676,12 +773,18 @@ pub fn render_status(ctx: &CanvasRenderingContext2d, canvas: &HtmlCanvasElement,
     let h = canvas.height() as f64;
     ctx.set_fill_style_str("#000");
     ctx.fill_rect(0.0, 0.0, w, h);
-    ctx.set_fill_style_str("#0a0");
+    ctx.set_fill_style_str("#6cf");
     ctx.set_font("18px monospace");
     let _ = ctx.fill_text(status, 20.0, 40.0);
 }
 
-fn draw_ship(ctx: &CanvasRenderingContext2d, camera: &Camera, ship: &Ship, name: Option<&str>) {
+fn draw_ship(
+    ctx: &CanvasRenderingContext2d,
+    camera: &Camera,
+    ship: &Ship,
+    name: Option<&str>,
+    is_bot: bool,
+) {
     // For wrap maps, the ship may be on the "other side" of the seam from
     // the camera; shift all 3 vertices by the same offset so the triangle
     // stays rigid while crossing the boundary.
@@ -703,6 +806,17 @@ fn draw_ship(ctx: &CanvasRenderingContext2d, camera: &Camera, ship: &Ship, name:
     ctx.close_path();
     ctx.fill();
     ctx.stroke();
+
+    // Bot tell: a small red dot at the ship centroid — reads as a "brain
+    // light" against the otherwise-blank triangle. Drawn after stroke so
+    // it sits on top.
+    if is_bot {
+        let (cx, cy) = camera.world_to_screen(visual_pos);
+        ctx.set_fill_style_str("#f44");
+        ctx.begin_path();
+        let _ = ctx.arc(cx, cy, 2.0, 0.0, core::f64::consts::TAU);
+        ctx.fill();
+    }
 
     if let Some(name) = name {
         // Yellow italic monospace, 35px below ship.pos — matches the Elm

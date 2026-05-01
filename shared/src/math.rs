@@ -100,3 +100,37 @@ pub fn wrap_angle(a: f32) -> f32 {
     let r = a - libm::floorf(a / TWO_PI) * TWO_PI;
     if r < 0.0 { r + TWO_PI } else { r }
 }
+
+/// Per-axis torus distance: shortest distance between `a` and `b` modulo
+/// `world_dim`, ignoring sign. For non-wrapping axes, pass the same value
+/// you would pass for a wrap one — the caller picks whether to use this or
+/// plain `(a - b).abs()` based on the map's `edge_wrap` flag.
+fn torus_axis_dist(a: f32, b: f32, world_dim: f32) -> f32 {
+    let d = (a - b).abs();
+    if d > world_dim * 0.5 { world_dim - d } else { d }
+}
+
+/// Is point `p` inside the axis-aligned rectangle centered at `center` with
+/// half-extents `(half_w, half_h)`, with optional torus wrap? Used by the
+/// server's per-player snapshot filter so an entity sitting just past the
+/// world seam is still considered "in view" of a camera near the opposite
+/// seam.
+pub fn point_in_rect_torus(
+    p: Vec2,
+    center: Vec2,
+    half_w: f32,
+    half_h: f32,
+    world_w: f32,
+    world_h: f32,
+    edge_wrap: bool,
+) -> bool {
+    let (dx, dy) = if edge_wrap {
+        (
+            torus_axis_dist(p.x, center.x, world_w),
+            torus_axis_dist(p.y, center.y, world_h),
+        )
+    } else {
+        ((p.x - center.x).abs(), (p.y - center.y).abs())
+    };
+    dx <= half_w && dy <= half_h
+}

@@ -29,13 +29,10 @@ use crate::lobby::{Lobby, RoomHandle};
 use crate::room::{JoinResult, RoomCommand};
 use crate::webrtc_session::{server_reliability, WebRtcSession};
 
-const OUTBOUND_BUFFER: usize = 64;
+const OUTBOUND_BUFFER: usize = 16;
 const SIGNAL_BUFFER: usize = 16;
 
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(lobby): State<Arc<Lobby>>,
-) -> Response {
+pub async fn ws_handler(ws: WebSocketUpgrade, State(lobby): State<Arc<Lobby>>) -> Response {
     ws.on_upgrade(move |socket| handle_socket(socket, lobby))
 }
 
@@ -92,10 +89,7 @@ async fn handle_socket(socket: WebSocket, lobby: Arc<Lobby>) {
     let _ = writer.await;
 }
 
-async fn write_loop(
-    mut write: SplitSink<WebSocket, Message>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
-) {
+async fn write_loop(mut write: SplitSink<WebSocket, Message>, mut rx: mpsc::Receiver<Vec<u8>>) {
     while let Some(bytes) = rx.recv().await {
         if write.send(Message::Binary(bytes)).await.is_err() {
             break;
@@ -172,7 +166,19 @@ async fn route_outbound(
         false
     };
     if !sent {
-        let _ = ws_out_tx.send(bytes).await;
+        match reliability {
+            Reliability::Unreliable => {
+                // Snapshots are superseded by the next snapshot. If TCP/WS is
+                // backed up, dropping this frame is better than blocking the
+                // router and letting stale snapshots pile up behind it.
+                if ws_out_tx.try_send(bytes).is_err() {
+                    tracing::debug!("dropping unreliable outbound frame; websocket queue full");
+                }
+            }
+            Reliability::Reliable => {
+                let _ = ws_out_tx.send(bytes).await;
+            }
+        }
     }
 }
 
@@ -313,6 +319,19 @@ async fn try_join(
     }
 }
 
+/// Drop the player from their current room (if any) and clear the slot so
+/// the next try_join can populate it. Used when the same connection switches
+/// rooms — without this, JoinRoom/CreateRoom silently no-op because we
+/// auto-join a room on first connect.
+async fn leave_current_room(player_id: PlayerId, current_room: &mut Option<RoomHandle>) {
+    if let Some(room) = current_room.take() {
+        let _ = room
+            .room_tx
+            .send(RoomCommand::RemovePlayer { player_id })
+            .await;
+    }
+}
+
 /// Returns false when the connection should terminate (Leave or fatal).
 async fn handle_message(
     cm: ClientMessage,
@@ -396,15 +415,14 @@ async fn handle_message(
                 Some(p) => p,
                 None => return true,
             };
-            if current_room.is_some() {
-                return true;
-            }
+            // Already in a room (e.g. auto-joined on first connect) — leave
+            // it first so the new room can take this player. Otherwise the
+            // create silently no-ops and the lobby looks broken.
+            leave_current_room(pid, current_room).await;
             let room = match lobby.create_room(room_name, map_name, bot_count).await {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = out_tx
-                        .send(ServerMessage::Error { message: e })
-                        .await;
+                    let _ = out_tx.send(ServerMessage::Error { message: e }).await;
                     return true;
                 }
             };
@@ -418,9 +436,9 @@ async fn handle_message(
                 Some(p) => p,
                 None => return true,
             };
-            if current_room.is_some() {
-                return true;
-            }
+            // Already in a room — drop it before the join so room-switching
+            // works from the lobby.
+            leave_current_room(pid, current_room).await;
             let room = match room_id {
                 Some(id) => match lobby.get_room(id).await {
                     Some(r) => r,
@@ -436,9 +454,7 @@ async fn handle_message(
                 None => match lobby.quick_join().await {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = out_tx
-                            .send(ServerMessage::Error { message: e })
-                            .await;
+                        let _ = out_tx.send(ServerMessage::Error { message: e }).await;
                         return true;
                     }
                 },
@@ -461,6 +477,42 @@ async fn handle_message(
                 .send(RoomCommand::Input {
                     player_id: pid,
                     input,
+                })
+                .await;
+        }
+        ClientMessage::Viewport {
+            half_width,
+            half_height,
+        } => {
+            let pid = match *player_id {
+                Some(p) => p,
+                None => return true,
+            };
+            let Some(room) = current_room.as_ref() else {
+                return true;
+            };
+            let _ = room
+                .room_tx
+                .send(RoomCommand::Viewport {
+                    player_id: pid,
+                    half_width,
+                    half_height,
+                })
+                .await;
+        }
+        ClientMessage::Chat { text } => {
+            let pid = match *player_id {
+                Some(p) => p,
+                None => return true,
+            };
+            let Some(room) = current_room.as_ref() else {
+                return true;
+            };
+            let _ = room
+                .room_tx
+                .send(RoomCommand::Chat {
+                    player_id: pid,
+                    text,
                 })
                 .await;
         }

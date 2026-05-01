@@ -105,3 +105,9 @@ pub const CANNON_AIM_NOISE_RAD: f32 = core::f32::consts::PI / 12.0; // ±15°
 // Networking
 pub const ROOM_PLAYER_CAP: usize = 8;
 pub const ROOM_IDLE_TIMEOUT_SECONDS: f32 = 30.0;
+/// Padding added to a client's reported viewport on each side when filtering
+/// bullets/particles into per-player snapshots. Sized so the fastest entities
+/// can't cross it within one interp window: BULLET_SPEED * INTERP_DELAY_S =
+/// 220 * 0.1 ≈ 22u, and we round up generously so a brief stall on the wire
+/// can't expose a pop-in either.
+pub const AOI_MARGIN: f32 = 200.0;

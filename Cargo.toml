@@ -78,6 +78,7 @@ features = [
     "RtcIceCandidate",
     "RtcIceCandidateInit",
     "RtcPeerConnectionIceEvent",
+    "Storage",
 ]
 
 [profile.release]

@@ -10,12 +10,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use shared::constants::{
-    ROOM_IDLE_TIMEOUT_SECONDS, ROOM_PLAYER_CAP, SHIP_RESPAWN_SECONDS, SNAPSHOT_RATE_HZ,
-    TICK_DT_SECONDS, TICK_RATE_HZ,
+    AOI_MARGIN, ROOM_IDLE_TIMEOUT_SECONDS, ROOM_PLAYER_CAP, SHIP_RESPAWN_SECONDS,
+    SNAPSHOT_RATE_HZ, TICK_DT_SECONDS, TICK_RATE_HZ,
 };
 use shared::entities::{EntityId, PlayerId};
 use shared::map::Map;
-use shared::math::Vec2;
+use shared::math::{point_in_rect_torus, Vec2};
 use shared::protocol::{
     ClientTick, GameEvent, PlayerInfo, RoomId, ServerMessage, ServerTick, Snapshot, TickInput,
 };
@@ -39,6 +39,19 @@ pub enum RoomCommand {
     Input {
         player_id: PlayerId,
         input: TickInput,
+    },
+    /// Per-player AOI hint. Sticky: the latest value wins and is used for
+    /// every snapshot until replaced. `None` half-extents means "no filter".
+    Viewport {
+        player_id: PlayerId,
+        half_width: f32,
+        half_height: f32,
+    },
+    /// Free-text chat. Server trims + length-caps then rebroadcasts as
+    /// `GameEvent::Chat`. Empty strings are dropped silently.
+    Chat {
+        player_id: PlayerId,
+        text: String,
     },
     RemovePlayer {
         player_id: PlayerId,
@@ -65,6 +78,20 @@ struct Player {
     deaths: u32,
     /// `Some(tick)` if dead and waiting to respawn at `tick`.
     respawn_at_tick: Option<ServerTick>,
+    /// Latest reported viewport from the client. `None` until the first
+    /// `ClientMessage::Viewport` arrives — snapshots are unfiltered until
+    /// then so a slow client never sees an empty world.
+    viewport: Option<(f32, f32)>,
+    /// Last position of this player's ship while alive — used as the AOI
+    /// center while the player is dead/respawning so they keep seeing the
+    /// area where they died instead of an empty (0,0) corner.
+    last_alive_pos: Option<Vec2>,
+    /// Server-spawned bot. Surfaced on PlayerInfo so clients can decorate
+    /// the name distinctly from humans.
+    is_bot: bool,
+    /// Per-bot AI scratch space (evade timers, cached flee targets, …).
+    /// `Default` for humans; populated/used by `bot::tick_for`.
+    bot_state: crate::bot::BotState,
 }
 
 impl Player {
@@ -81,8 +108,11 @@ const BOT_PLAYER_ID_BASE: PlayerId = 1_000_000;
 const BOT_IDS_PER_ROOM: PlayerId = 100;
 /// Names lifted from classic xpilot.org screenshots — flavour only. Sliced
 /// to `bot_count` at room start; an enclosing call clamps to `<= 8`.
+/// First five are the personality bots (Sid + the named-personality
+/// variants) so even a small-bot-count room shows off the variety; the
+/// rest fall back to Sid via `bot::tick_for`.
 const BOT_NAMES: [&str; 8] = [
-    "Sid", "Cobra", "Wimpy", "Slugger", "Spike", "Diesel", "Reaper", "Vega",
+    "Sid", "Reaper", "Cobra", "Vega", "Wimpy", "Slugger", "Spike", "Diesel",
 ];
 
 pub async fn run(
@@ -110,13 +140,36 @@ pub async fn run(
     }
 
     let mut sim = interval(SIM_PERIOD);
-    sim.set_missed_tick_behavior(MissedTickBehavior::Burst);
+    // Real-time game state should not replay missed ticks in a burst after the
+    // process is descheduled. A burst catches sim time up, but it also emits a
+    // clump of snapshots that looks like visual strobe after a VM/host pause.
+    sim.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut tick_counter: u32 = 0;
     // Set on construction and reset whenever humans drops to zero. Cleared
     // when a human joins. Once it's been Some(t) longer than IDLE_DESTROY,
     // the room removes itself from the registry and exits.
     let mut empty_since: Option<Instant> = Some(Instant::now());
+
+    // Tick timing telemetry — lets us tell server-side stutter (slow sim or
+    // CPU starvation by the host) apart from network jitter. Rolled up every
+    // 5 s alongside the existing state log. Why two metrics:
+    //   work_us: how long the sim+broadcast took. >TICK_DT means we can't keep up.
+    //   gap_us:  wall time between consecutive ticks. >>SIM_PERIOD with low work
+    //            implies the OS didn't schedule us — i.e. CPU steal from a noisy
+    //            VM neighbour or a tokio task hogging the runtime.
+    let mut last_tick_at: Option<Instant> = None;
+    let mut max_work_us: u64 = 0;
+    let mut max_gap_us: u64 = 0;
+    let mut slow_ticks: u32 = 0;
+    // Lateness counters: a single late tick is invisible; a *cluster* is stutter.
+    // Two thresholds so we can tell "tokio jitter" (~25 ms occasionally) apart
+    // from "missed a whole tick" (>=33 ms — gap big enough to skip a frame).
+    let mut late_ticks: u32 = 0; // >= 1.5 * period (~25 ms)
+    let mut very_late_ticks: u32 = 0; // >= 2.0 * period (~33 ms)
+    let slow_threshold = SIM_PERIOD; // anything >= the budget means we slipped
+    let late_threshold_us = (SIM_PERIOD.as_micros() as u64 * 3) / 2;
+    let very_late_threshold_us = SIM_PERIOD.as_micros() as u64 * 2;
 
     loop {
         // Idle-shutdown check. Done at the top so a room with zero humans
@@ -153,12 +206,21 @@ pub async fn run(
                 }
             }
             _ = sim.tick() => {
+                let tick_start = Instant::now();
+                let gap_us = last_tick_at
+                    .map(|t| tick_start.saturating_duration_since(t).as_micros() as u64)
+                    .unwrap_or(0);
+                last_tick_at = Some(tick_start);
+                if gap_us > max_gap_us { max_gap_us = gap_us; }
+                if gap_us >= very_late_threshold_us { very_late_ticks += 1; }
+                else if gap_us >= late_threshold_us { late_ticks += 1; }
+
                 // Bot brains: each alive bot gets fresh input this tick.
                 for pid in &bots {
-                    let Some(p) = players.get(pid) else { continue };
+                    let Some(p) = players.get_mut(pid) else { continue };
                     if !p.alive() { continue }
                     let Some(ship) = world.ships.get(&p.entity_id) else { continue };
-                    let input = crate::bot::sid_tick(&world, ship);
+                    let input = crate::bot::tick_for(&p.name, &world, ship, &mut p.bot_state);
                     latest_inputs.insert(p.entity_id, input);
                 }
 
@@ -192,16 +254,32 @@ pub async fn run(
 
                 tick_counter = tick_counter.wrapping_add(1);
                 if tick_counter % SNAPSHOTS_EVERY_N_TICKS == 0 {
-                    broadcast_snapshot(&world, &players);
+                    broadcast_snapshot(&world, &mut players);
                 }
+
+                let work_us = tick_start.elapsed().as_micros() as u64;
+                if work_us > max_work_us { max_work_us = work_us; }
+                if work_us as u128 >= slow_threshold.as_micros() { slow_ticks += 1; }
+
                 if tick_counter % (TICK_RATE_HZ * 5) == 0 {
-                    tracing::debug!(
+                    tracing::info!(
+                        room_id,
                         tick = world.tick,
                         ships = world.ships.len(),
                         bullets = world.bullets.len(),
                         players = players.len(),
-                        "state"
+                        max_work_us,
+                        max_gap_us,
+                        slow_ticks,
+                        late_ticks,
+                        very_late_ticks,
+                        "tick_stats"
                     );
+                    max_work_us = 0;
+                    max_gap_us = 0;
+                    slow_ticks = 0;
+                    late_ticks = 0;
+                    very_late_ticks = 0;
                 }
             }
         }
@@ -217,10 +295,17 @@ async fn handle_command(
     human_count: &Arc<AtomicUsize>,
 ) {
     match cmd {
-        RoomCommand::AddPlayer { player_id, name, outbound, ack } => {
+        RoomCommand::AddPlayer {
+            player_id,
+            name,
+            outbound,
+            ack,
+        } => {
             // Cap is humans-only; bots don't compete for slots.
             if human_count.load(Ordering::Relaxed) >= ROOM_PLAYER_CAP {
-                let _ = ack.send(JoinAck { result: JoinResult::Full });
+                let _ = ack.send(JoinAck {
+                    result: JoinResult::Full,
+                });
                 tracing::info!(player_id, room_id, "join rejected — room full");
                 return;
             }
@@ -233,6 +318,7 @@ async fn handle_command(
                 kills: 0,
                 deaths: 0,
                 dead: false,
+                is_bot: false,
             })
             .chain(players.iter().map(|(pid, p)| PlayerInfo {
                 player_id: *pid,
@@ -240,6 +326,7 @@ async fn handle_command(
                 kills: p.kills,
                 deaths: p.deaths,
                 dead: !p.alive(),
+                is_bot: p.is_bot,
             }))
             .collect();
             let joined = ServerMessage::JoinedRoom {
@@ -255,6 +342,7 @@ async fn handle_command(
                 kills: 0,
                 deaths: 0,
                 dead: false,
+                is_bot: false,
             });
             for p in players.values() {
                 if let Some(out) = p.outbound.as_ref() {
@@ -271,6 +359,10 @@ async fn handle_command(
                     kills: 0,
                     deaths: 0,
                     respawn_at_tick: None,
+                    viewport: None,
+                    last_alive_pos: None,
+                    is_bot: false,
+                    bot_state: Default::default(),
                 },
             );
             human_count.fetch_add(1, Ordering::Relaxed);
@@ -286,6 +378,41 @@ async fn handle_command(
                     p.last_input_tick = input.client_tick;
                 }
             }
+        }
+        RoomCommand::Viewport {
+            player_id,
+            half_width,
+            half_height,
+        } => {
+            if let Some(p) = players.get_mut(&player_id) {
+                // Sanity-cap to world dim/2 — anything larger filters nothing
+                // anyway, and saves us from a buggy client claiming millions.
+                // Floor at 1.0 so a zero/negative value can't accidentally
+                // collapse the AOI to a point.
+                let hw = half_width.clamp(1.0, world.map.width * 0.5);
+                let hh = half_height.clamp(1.0, world.map.height * 0.5);
+                p.viewport = Some((hw, hh));
+            }
+        }
+        RoomCommand::Chat { player_id, text } => {
+            // Reject if not in the room (stale message after Leave) or if the
+            // body is empty after trim. 200-char cap so a misbehaving client
+            // can't dump megabytes — chars(), not bytes(), so multi-byte
+            // characters count once.
+            if !players.contains_key(&player_id) {
+                return;
+            }
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            const CHAT_MAX_CHARS: usize = 200;
+            let bounded: String = trimmed.chars().take(CHAT_MAX_CHARS).collect();
+            let event = GameEvent::Chat {
+                player_id,
+                text: bounded,
+            };
+            broadcast_event(&event, players);
         }
         RoomCommand::RemovePlayer { player_id } => {
             if let Some(p) = players.remove(&player_id) {
@@ -312,7 +439,9 @@ fn process_events(
 ) {
     for ev in events {
         match ev {
-            GameEvent::ShipDied { entity_id, killer, .. } => {
+            GameEvent::ShipDied {
+                entity_id, killer, ..
+            } => {
                 // Find the victim by entity_id (slow — small N), bump deaths,
                 // schedule respawn, drop their queued input.
                 let victim_pid = players
@@ -346,15 +475,15 @@ fn process_events(
                     }
                 }
             }
-            GameEvent::HitScored { .. } | GameEvent::BulletFired { .. } | GameEvent::ShipSpawned { .. } => {}
+            GameEvent::HitScored { .. }
+            | GameEvent::BulletFired { .. }
+            | GameEvent::ShipSpawned { .. }
+            | GameEvent::Chat { .. } => {}
         }
     }
 }
 
-fn handle_respawns(
-    world: &mut shared::world::World,
-    players: &mut BTreeMap<PlayerId, Player>,
-) {
+fn handle_respawns(world: &mut shared::world::World, players: &mut BTreeMap<PlayerId, Player>) {
     let now = world.tick;
     let mut to_respawn: Vec<(PlayerId, EntityId)> = Vec::new();
     for (pid, p) in players.iter() {
@@ -389,13 +518,14 @@ fn broadcast_event(event: &GameEvent, players: &BTreeMap<PlayerId, Player>) {
     }
 }
 
-fn broadcast_snapshot(world: &shared::world::World, players: &BTreeMap<PlayerId, Player>) {
+fn broadcast_snapshot(world: &shared::world::World, players: &mut BTreeMap<PlayerId, Player>) {
     if players.is_empty() {
         return;
     }
+    // Ships are *always* sent in full — clients need them for the radar (out-
+    // of-view dots) and to anchor thruster particles for enemies thrusting
+    // onto the edge of the screen.
     let ships: Vec<_> = world.ships.values().cloned().collect();
-    let bullets: Vec<_> = world.bullets.values().cloned().collect();
-    let particles = world.particles.clone();
     let dead_cannons: Vec<(u32, u32)> = world
         .cannons
         .iter()
@@ -411,16 +541,63 @@ fn broadcast_snapshot(world: &shared::world::World, players: &BTreeMap<PlayerId,
             kills: p.kills,
             deaths: p.deaths,
             dead: !p.alive(),
+            is_bot: p.is_bot,
         })
         .collect();
-    for p in players.values() {
-        let Some(out) = p.outbound.as_ref() else { continue };
+    let world_w = world.map.width;
+    let world_h = world.map.height;
+    let edge_wrap = world.map.edge_wrap;
+    for p in players.values_mut() {
+        // Refresh last_alive_pos every tick the player has a live ship; used
+        // as the AOI anchor while they're respawning so they keep seeing the
+        // area where they died.
+        if let Some(ship) = world.ships.get(&p.entity_id) {
+            p.last_alive_pos = Some(ship.pos);
+        }
+        let Some(out) = p.outbound.as_ref() else {
+            continue;
+        };
+        // Build the per-player snapshot. AOI center is current ship pos if
+        // alive, else last-alive pos. If neither exists (brand-new joiner
+        // mid-tick) or no viewport reported yet, send unfiltered — better an
+        // oversized snapshot than an empty one.
+        let center = world
+            .ships
+            .get(&p.entity_id)
+            .map(|s| s.pos)
+            .or(p.last_alive_pos);
+        let (bullets, particles) = match (center, p.viewport) {
+            (Some(c), Some((hw, hh))) => {
+                let hw = hw + AOI_MARGIN;
+                let hh = hh + AOI_MARGIN;
+                let in_view = |pos: Vec2| {
+                    point_in_rect_torus(pos, c, hw, hh, world_w, world_h, edge_wrap)
+                };
+                let bullets: Vec<_> = world
+                    .bullets
+                    .values()
+                    .filter(|b| in_view(b.pos))
+                    .cloned()
+                    .collect();
+                let particles: Vec<_> = world
+                    .particles
+                    .iter()
+                    .filter(|pt| in_view(pt.pos))
+                    .cloned()
+                    .collect();
+                (bullets, particles)
+            }
+            _ => (
+                world.bullets.values().cloned().collect(),
+                world.particles.clone(),
+            ),
+        };
         let snap = Snapshot {
             server_tick,
             your_last_processed_input: p.last_input_tick,
             ships: ships.clone(),
-            bullets: bullets.clone(),
-            particles: particles.clone(),
+            bullets,
+            particles,
             players: player_infos.clone(),
             dead_cannons: dead_cannons.clone(),
         };
@@ -449,6 +626,10 @@ fn spawn_bot(
             kills: 0,
             deaths: 0,
             respawn_at_tick: None,
+            viewport: None,
+            last_alive_pos: None,
+            is_bot: true,
+            bot_state: Default::default(),
         },
     );
     tracing::info!(player_id, entity_id, "bot spawned");

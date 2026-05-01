@@ -60,7 +60,27 @@ struct App {
     /// Cached map names from the server's `AvailableMaps` push. Re-populated
     /// into the create-room dropdown whenever they arrive.
     available_maps: Vec<String>,
+    /// Latch for the auto-join-on-first-RoomList behavior. Once we've sent
+    /// the auto join/create, we don't repeat it on subsequent RoomList
+    /// arrivals (e.g. user hits Refresh in the lobby) — those are
+    /// user-initiated browses, not the cold start.
+    auto_joined: bool,
+    /// True until the first JoinedRoom arrives. Drives the "show lobby
+    /// over the freshly-joined game" behavior so a new player sees the
+    /// rooms list with the auto-joined match running behind it; subsequent
+    /// joins (e.g. user picked a room and hit Join) skip straight into the
+    /// game with no overlay.
+    first_join_pending: bool,
+    /// Room id we're currently in, for the "click Join on the room you're
+    /// already in → close lobby instead of sending a no-op JoinRoom" UX.
+    current_room_id: Option<u32>,
+    /// Recent chat messages, oldest-first. Each entry holds a wall-clock
+    /// arrival time so the renderer can fade old lines out and drop them
+    /// once they're invisible.
+    chat_log: VecDeque<render::ChatLine>,
 }
+
+const CHAT_MAX_LINES: usize = 20;
 
 struct TimedSnapshot {
     snap: Snapshot,
@@ -164,11 +184,20 @@ pub fn start() -> Result<(), JsValue> {
         game: None,
         status: "connecting…".into(),
         available_maps: Vec::new(),
+        auto_joined: false,
+        first_join_pending: true,
+        current_room_id: None,
+        chat_log: VecDeque::with_capacity(CHAT_MAX_LINES),
     });
 
-    show_lobby(&document, true);
+    load_saved_name(&window, &document);
+    install_name_persistence(&window, &document)?;
+    set_ui_mode(&document, UiMode::LobbyOnly);
     install_lobby_handlers(&document, app.clone())?;
+    install_lobby_overlay_handlers(&window, &document, app.clone())?;
+    install_chat_handlers(&window, &document, app.clone())?;
     install_focus_clear(&window, app.clone())?;
+    install_resize_handler(&window, app.clone())?;
     spawn_animation_loop(app);
     Ok(())
 }
@@ -183,16 +212,80 @@ fn read_player_name(doc: &Document) -> String {
         .unwrap_or_else(|| "Player".into())
 }
 
-fn show_lobby(doc: &Document, lobby_visible: bool) {
-    if let Some(el) = doc.get_element_by_id("lobby") {
-        if lobby_visible {
-            el.remove_attribute("hidden").ok();
-        } else {
-            el.set_attribute("hidden", "").ok();
-        }
+const NAME_STORAGE_KEY: &str = "xpilot_name";
+
+/// On startup, replace the empty/default value in #player-name with whatever
+/// the player typed last session. Silent-no-op if localStorage is unavailable
+/// (private mode, file://) — the input keeps its HTML default.
+fn load_saved_name(window: &web_sys::Window, doc: &Document) {
+    let Some(storage) = window.local_storage().ok().flatten() else { return };
+    let Ok(Some(saved)) = storage.get_item(NAME_STORAGE_KEY) else { return };
+    if saved.trim().is_empty() {
+        return;
     }
-    if let Some(el) = doc.get_element_by_id("game") {
-        if lobby_visible {
+    if let Some(input) = doc
+        .get_element_by_id("player-name")
+        .and_then(|el| el.dyn_into::<HtmlInputElement>().ok())
+    {
+        input.set_value(&saved);
+    }
+}
+
+/// Persist #player-name to localStorage on every keystroke. Trim before
+/// saving so a stray space doesn't survive across reloads. No debounce —
+/// localStorage writes are fast enough that per-keystroke is fine.
+fn install_name_persistence(window: &web_sys::Window, doc: &Document) -> Result<(), JsValue> {
+    let Some(input) = doc
+        .get_element_by_id("player-name")
+        .and_then(|el| el.dyn_into::<HtmlInputElement>().ok())
+    else {
+        return Ok(());
+    };
+    let storage = match window.local_storage() {
+        Ok(Some(s)) => s,
+        _ => return Ok(()),
+    };
+    let input_for_cb = input.clone();
+    let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_ev| {
+        let v = input_for_cb.value();
+        let _ = storage.set_item(NAME_STORAGE_KEY, v.trim());
+    });
+    input.add_event_listener_with_callback("input", cb.as_ref().unchecked_ref())?;
+    cb.forget();
+    Ok(())
+}
+
+/// UI is in one of three modes. The lobby was originally a page-replace
+/// (lobby OR game), but adding "open lobby mid-game without leaving" pushed
+/// it to a true overlay — so we encode the three valid states explicitly
+/// rather than juggling individual hidden attributes per call site.
+#[derive(Clone, Copy)]
+enum UiMode {
+    /// Initial state. Lobby fills the page, no game running behind.
+    LobbyOnly,
+    /// In a game, no lobby. Rooms button visible to bring the lobby back.
+    GameOnly,
+    /// In a game with the lobby overlaid on top — backdrop dims the game,
+    /// X / Esc / click-outside dismiss back to GameOnly.
+    GameWithLobby,
+}
+
+fn set_ui_mode(doc: &Document, mode: UiMode) {
+    let (lobby, backdrop, close_x, game, rooms_btn) = match mode {
+        UiMode::LobbyOnly => (true, false, false, false, false),
+        UiMode::GameOnly => (false, false, false, true, true),
+        UiMode::GameWithLobby => (true, true, true, true, false),
+    };
+    set_hidden(doc, "lobby", !lobby);
+    set_hidden(doc, "lobby-backdrop", !backdrop);
+    set_hidden(doc, "lobby-close", !close_x);
+    set_hidden(doc, "game", !game);
+    set_hidden(doc, "rooms-btn", !rooms_btn);
+}
+
+fn set_hidden(doc: &Document, id: &str, hidden: bool) {
+    if let Some(el) = doc.get_element_by_id(id) {
+        if hidden {
             el.set_attribute("hidden", "").ok();
         } else {
             el.remove_attribute("hidden").ok();
@@ -285,14 +378,28 @@ fn install_lobby_handlers(
         }
     };
 
-    // Quick Join → JoinRoom { room_id: None }
+    // Quick Join → JoinRoom { room_id: None }, unless the player is already
+    // in *some* room — in that case the button just dismisses the lobby
+    // (server would reject a second join anyway, and "Quick Join" while
+    // mid-game intuitively means "back to my game").
     if let Some(btn) = doc
         .get_element_by_id("quick-join")
         .and_then(|el| el.dyn_into::<HtmlButtonElement>().ok())
     {
         let send = send_msg_with_name.clone();
+        let app2 = app.clone();
+        let doc2 = doc.clone();
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-            send(ClientMessage::JoinRoom { room_id: None });
+            let already_in_game = app2
+                .borrow()
+                .as_ref()
+                .map(|a| a.current_room_id.is_some())
+                .unwrap_or(false);
+            if already_in_game {
+                set_ui_mode(&doc2, UiMode::GameOnly);
+            } else {
+                send(ClientMessage::JoinRoom { room_id: None });
+            }
         });
         btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
         cb.forget();
@@ -357,8 +464,12 @@ fn install_lobby_handlers(
 
     // Per-row Join button is delegated through the table body — buttons are
     // recreated each render so binding individual handlers would leak.
+    // Special case: clicking Join on the room you're already in just
+    // dismisses the lobby. Cleaner than sending a no-op JoinRoom.
     if let Some(tbody) = doc.get_element_by_id("room-list-body") {
         let send = send_msg_with_name;
+        let app2 = app.clone();
+        let doc2 = doc.clone();
         let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |ev: web_sys::Event| {
             let Some(target) = ev.target() else { return };
             let Some(el) = target.dyn_ref::<web_sys::Element>() else { return };
@@ -367,7 +478,15 @@ fn install_lobby_handlers(
             }
             let Some(rid_str) = el.get_attribute("data-room-id") else { return };
             let Ok(room_id) = rid_str.parse::<u32>() else { return };
-            send(ClientMessage::JoinRoom { room_id: Some(room_id) });
+            let current = app2
+                .borrow()
+                .as_ref()
+                .and_then(|a| a.current_room_id);
+            if current == Some(room_id) {
+                set_ui_mode(&doc2, UiMode::GameOnly);
+            } else {
+                send(ClientMessage::JoinRoom { room_id: Some(room_id) });
+            }
         });
         tbody.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
         cb.forget();
@@ -416,6 +535,294 @@ fn install_focus_clear(
             .add_event_listener_with_callback("visibilitychange", vis.as_ref().unchecked_ref())?;
         vis.forget();
     }
+    Ok(())
+}
+
+/// Send the current canvas-sized viewport to the server. The server uses it
+/// (plus AOI_MARGIN) to filter out bullets/particles outside our visible area
+/// from snapshots — keeping bandwidth proportional to what we can actually
+/// see on screen rather than the whole world. Cheap to send: only called on
+/// JoinedRoom and on window resize (no zoom yet).
+fn send_viewport(app: &App) {
+    if !app.transport.is_open() {
+        return;
+    }
+    let half_w = (app.canvas.width() as f32) * 0.5;
+    let half_h = (app.canvas.height() as f32) * 0.5;
+    app.transport.send(&ClientMessage::Viewport {
+        half_width: half_w,
+        half_height: half_h,
+    });
+}
+
+/// Wires the in-game ways of bringing the lobby back up:
+///   - "Rooms" button (top-left) → open
+///   - Escape key → toggle
+///   - X in the lobby corner → close
+///   - clicking the backdrop → close
+/// All four are no-ops before the player has joined a game (overlay only
+/// makes sense once there's a game running behind it).
+fn install_lobby_overlay_handlers(
+    window: &web_sys::Window,
+    document: &Document,
+    app: Rc<RefCell<Option<App>>>,
+) -> Result<(), JsValue> {
+    let doc = document.clone();
+
+    // Escape: toggle lobby — close if open, open if closed. Only acts when
+    // a game is running; otherwise leaves the initial-lobby alone.
+    let app_esc = app.clone();
+    let doc_esc = doc.clone();
+    let on_key = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
+        // Skip everything when chat is open — chat owns its own Esc handling
+        // and shouldn't lose keystrokes to the lobby toggle.
+        if !is_hidden(&doc_esc, "chat-input") {
+            return;
+        }
+        // Don't react if focus is in a form field (player-name input,
+        // create-room name, etc.) — typing letters there shouldn't fly the ship.
+        if active_is_form_field(&doc_esc) {
+            return;
+        }
+        let guard = app_esc.borrow();
+        let Some(a) = guard.as_ref() else { return };
+        if a.game.is_none() {
+            return;
+        }
+        let lobby_open = !is_hidden(&doc_esc, "lobby");
+        let key = ev.key();
+        let code = ev.code();
+        // Ship-control keys close the lobby and let input.rs's listener
+        // (which also reads window keydowns) start applying them to the
+        // ship the same tick. So someone who joins and just wants to fly
+        // can mash A/S/Shift/Space and the lobby gets out of the way.
+        let is_ship_key = matches!(
+            code.as_str(),
+            "KeyA" | "KeyS" | "KeyX"
+                | "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown"
+                | "ShiftLeft" | "ShiftRight"
+                | "Space" | "Enter"
+                | "ControlLeft" | "ControlRight"
+        );
+        if key == "Escape" {
+            if lobby_open {
+                set_ui_mode(&doc_esc, UiMode::GameOnly);
+            } else {
+                set_ui_mode(&doc_esc, UiMode::GameWithLobby);
+                a.transport.send(&ClientMessage::ListRooms);
+            }
+        } else if is_ship_key && lobby_open {
+            set_ui_mode(&doc_esc, UiMode::GameOnly);
+            // Don't prevent_default — input.rs's listener still gets this
+            // event and the keypress drives the ship the same frame.
+        }
+    });
+    window.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref())?;
+    on_key.forget();
+
+    // Rooms button — only visible while in GameOnly mode (set_ui_mode hides
+    // it whenever the lobby is up), so a click always means "open lobby".
+    if let Some(btn) = doc
+        .get_element_by_id("rooms-btn")
+        .and_then(|el| el.dyn_into::<HtmlButtonElement>().ok())
+    {
+        let app2 = app.clone();
+        let doc2 = doc.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            let guard = app2.borrow();
+            let Some(a) = guard.as_ref() else { return };
+            if a.game.is_none() {
+                return;
+            }
+            set_ui_mode(&doc2, UiMode::GameWithLobby);
+            a.transport.send(&ClientMessage::ListRooms);
+        });
+        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+        cb.forget();
+    }
+
+    // Close X.
+    if let Some(btn) = doc
+        .get_element_by_id("lobby-close")
+        .and_then(|el| el.dyn_into::<HtmlButtonElement>().ok())
+    {
+        let app2 = app.clone();
+        let doc2 = doc.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            let guard = app2.borrow();
+            let Some(a) = guard.as_ref() else { return };
+            if a.game.is_some() {
+                set_ui_mode(&doc2, UiMode::GameOnly);
+            }
+        });
+        btn.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+        cb.forget();
+    }
+
+    // Backdrop click. Pure dismiss — clicks on the lobby itself stop here
+    // because the backdrop is only the area outside the lobby.
+    if let Some(bd) = doc.get_element_by_id("lobby-backdrop") {
+        let app2 = app.clone();
+        let doc2 = doc.clone();
+        let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            let guard = app2.borrow();
+            let Some(a) = guard.as_ref() else { return };
+            if a.game.is_some() {
+                set_ui_mode(&doc2, UiMode::GameOnly);
+            }
+        });
+        bd.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref())?;
+        cb.forget();
+    }
+
+    Ok(())
+}
+
+fn is_hidden(doc: &Document, id: &str) -> bool {
+    doc.get_element_by_id(id)
+        .map(|el| el.has_attribute("hidden"))
+        .unwrap_or(true)
+}
+
+fn open_chat(doc: &Document) {
+    if let Some(input) = doc
+        .get_element_by_id("chat-input")
+        .and_then(|el| el.dyn_into::<HtmlInputElement>().ok())
+    {
+        input.set_value("");
+        input.remove_attribute("hidden").ok();
+        let _ = input.focus();
+    }
+}
+
+fn close_chat(doc: &Document) {
+    if let Some(input) = doc
+        .get_element_by_id("chat-input")
+        .and_then(|el| el.dyn_into::<HtmlInputElement>().ok())
+    {
+        input.set_value("");
+        input.set_attribute("hidden", "").ok();
+        let _ = input.blur();
+    }
+}
+
+/// Wires:
+///   - "m" key → open chat compose (only in-game, not when typing in another field)
+///   - chat-input Enter → send `ClientMessage::Chat` and close
+///   - chat-input Escape → cancel and close
+///   - chat-input blur → cancel and close (clicking elsewhere dismisses)
+fn install_chat_handlers(
+    window: &web_sys::Window,
+    document: &Document,
+    app: Rc<RefCell<Option<App>>>,
+) -> Result<(), JsValue> {
+    let doc = document.clone();
+
+    // Window-level "m" — open chat. Skipped if any input/select/etc is
+    // currently focused (so typing 'm' in the player-name field works) or if
+    // the chat input itself is already up.
+    let app_m = app.clone();
+    let doc_m = doc.clone();
+    let on_m = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |ev: web_sys::KeyboardEvent| {
+        if ev.key() != "m" && ev.key() != "M" {
+            return;
+        }
+        if !is_hidden(&doc_m, "chat-input") {
+            return; // already open
+        }
+        if active_is_form_field(&doc_m) {
+            return;
+        }
+        let guard = app_m.borrow();
+        let Some(a) = guard.as_ref() else { return };
+        if a.game.is_none() {
+            return;
+        }
+        // Don't let the literal "m" leak into the freshly-focused input.
+        ev.prevent_default();
+        open_chat(&doc_m);
+    });
+    window.add_event_listener_with_callback("keydown", on_m.as_ref().unchecked_ref())?;
+    on_m.forget();
+
+    // Chat input keydown — Enter sends, Escape cancels. stop_propagation so
+    // these don't trigger the global Escape→lobby toggle or the shipboard
+    // input handlers.
+    if let Some(input) = doc
+        .get_element_by_id("chat-input")
+        .and_then(|el| el.dyn_into::<HtmlInputElement>().ok())
+    {
+        let app_in = app.clone();
+        let doc_in = doc.clone();
+        let input_for_cb = input.clone();
+        let cb = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
+            move |ev: web_sys::KeyboardEvent| match ev.key().as_str() {
+                "Enter" => {
+                    ev.prevent_default();
+                    ev.stop_propagation();
+                    let text = input_for_cb.value();
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        let guard = app_in.borrow();
+                        if let Some(a) = guard.as_ref() {
+                            a.transport.send(&ClientMessage::Chat {
+                                text: trimmed.to_string(),
+                            });
+                        }
+                    }
+                    close_chat(&doc_in);
+                }
+                "Escape" => {
+                    ev.prevent_default();
+                    ev.stop_propagation();
+                    close_chat(&doc_in);
+                }
+                _ => {}
+            },
+        );
+        input.add_event_listener_with_callback("keydown", cb.as_ref().unchecked_ref())?;
+        cb.forget();
+
+        // Blur: if the user clicks somewhere else, close. Avoids a stuck
+        // input when they decide not to send.
+        let doc_blur = doc.clone();
+        let on_blur = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+            close_chat(&doc_blur);
+        });
+        input.add_event_listener_with_callback("blur", on_blur.as_ref().unchecked_ref())?;
+        on_blur.forget();
+    }
+
+    Ok(())
+}
+
+/// True if focus is currently in any form-field-like element. Used to gate
+/// the global "m" handler so typing 'm' in the player-name field doesn't
+/// also pop chat.
+fn active_is_form_field(doc: &Document) -> bool {
+    let Some(active) = doc.active_element() else { return false };
+    matches!(
+        active.tag_name().as_str(),
+        "INPUT" | "TEXTAREA" | "SELECT" | "BUTTON"
+    )
+}
+
+fn install_resize_handler(
+    window: &web_sys::Window,
+    app: Rc<RefCell<Option<App>>>,
+) -> Result<(), JsValue> {
+    let resize = Closure::<dyn FnMut(web_sys::Event)>::new(move |_ev| {
+        let guard = app.borrow();
+        if let Some(a) = guard.as_ref() {
+            // Only meaningful once in-game; harmless before that (server
+            // ignores Viewport from a player not in a room).
+            if a.game.is_some() {
+                send_viewport(a);
+            }
+        }
+    });
+    window.add_event_listener_with_callback("resize", resize.as_ref().unchecked_ref())?;
+    resize.forget();
     Ok(())
 }
 
@@ -474,6 +881,34 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             if let Some(d) = &doc {
                 render_room_list(d, &rooms);
             }
+            // Auto-join on first RoomList: hop straight into a non-full room
+            // if any exists, else create one with the tournament map and 4
+            // bots. Latched so a later Refresh doesn't try to join again.
+            if !app.auto_joined && app.game.is_none() {
+                app.auto_joined = true;
+                let name = doc
+                    .as_ref()
+                    .map(|d| read_player_name(d))
+                    .unwrap_or_else(|| "Player".into());
+                app.transport.send(&ClientMessage::SetName { name });
+                let target = rooms.iter().find(|r| r.player_count < r.cap);
+                match target {
+                    Some(r) => {
+                        log::info!("auto-joining room {} ({})", r.room_id, r.name);
+                        app.transport.send(&ClientMessage::JoinRoom {
+                            room_id: Some(r.room_id),
+                        });
+                    }
+                    None => {
+                        log::info!("no rooms — auto-creating tournament w/ 4 bots");
+                        app.transport.send(&ClientMessage::CreateRoom {
+                            name: "auto".into(),
+                            map_name: "tournament".into(),
+                            bot_count: 4,
+                        });
+                    }
+                }
+            }
         }
         ServerMessage::JoinedRoom { room_id, map, players, your_ship_id } => {
             log::info!(
@@ -482,6 +917,7 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
                 your_ship_id,
                 players.len()
             );
+            app.current_room_id = Some(room_id);
             let world = World::new(map);
             let radar_walls = doc
                 .as_ref()
@@ -501,8 +937,22 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             app.local_tick = 0;
             app.status = String::new();
             if let Some(d) = &doc {
-                show_lobby(d, false);
+                // First join of the session: leave the lobby up so the player
+                // can see the room list with the auto-joined match running
+                // behind it. Subsequent joins (manual room pick) snap right
+                // into gameplay.
+                let mode = if app.first_join_pending {
+                    app.first_join_pending = false;
+                    app.transport.send(&ClientMessage::ListRooms);
+                    UiMode::GameWithLobby
+                } else {
+                    UiMode::GameOnly
+                };
+                set_ui_mode(d, mode);
             }
+            // First Viewport — server uses this immediately for AOI culling.
+            // Until it arrives, the server sends unfiltered snapshots.
+            send_viewport(app);
         }
         ServerMessage::PlayerJoined(p) => {
             log::info!("player joined: {} ({})", p.name, p.player_id);
@@ -554,6 +1004,32 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             });
         }
         ServerMessage::Event(ev) => {
+            // Chat is the only event that doesn't require an active GameView
+            // — incoming chats are kept even if the snapshot pump hasn't
+            // populated the world yet (e.g. immediately after JoinedRoom).
+            if let GameEvent::Chat { player_id, ref text } = ev {
+                let author = app
+                    .game
+                    .as_ref()
+                    .and_then(|g| g.latest_snapshot.as_ref())
+                    .and_then(|ts| ts.snap.players.iter().find(|p| p.player_id == player_id))
+                    .map(|p| {
+                        if p.is_bot {
+                            format!("{} (R)", p.name)
+                        } else {
+                            p.name.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| format!("p{}", player_id));
+                if app.chat_log.len() == CHAT_MAX_LINES {
+                    app.chat_log.pop_front();
+                }
+                app.chat_log.push_back(render::ChatLine {
+                    author,
+                    text: text.clone(),
+                    t_ms: perf_now(),
+                });
+            }
             if let Some(g) = app.game.as_mut() {
                 if let GameEvent::ShipDied { entity_id, pos, .. } = ev {
                     // Explosion particles now come from the server via
@@ -669,6 +1145,8 @@ fn frame(app_cell: &Rc<RefCell<Option<App>>>, timestamp_ms: f64) {
             local_charge,
             respawn_in,
             g.radar_walls.as_ref(),
+            &app.chat_log,
+            timestamp_ms,
         );
     } else {
         render::render_status(&app.ctx, &app.canvas, &app.status);
