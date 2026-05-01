@@ -108,12 +108,10 @@ const BOT_PLAYER_ID_BASE: PlayerId = 1_000_000;
 const BOT_IDS_PER_ROOM: PlayerId = 100;
 /// Names lifted from classic xpilot.org screenshots — flavour only. Sliced
 /// to `bot_count` at room start; an enclosing call clamps to `<= 8`.
-/// First five are the personality bots (Sid + the named-personality
-/// variants) so even a small-bot-count room shows off the variety; the
-/// rest fall back to Sid via `bot::tick_for`.
-const BOT_NAMES: [&str; 8] = [
-    "Sid", "Reaper", "Cobra", "Vega", "Wimpy", "Slugger", "Spike", "Diesel",
-];
+/// Hard cap on bots per room. Personalities are picked at random from
+/// `bot::PERSONALITY_POOL` (weighted toward Sid), so we don't need a
+/// fixed name list anymore.
+const MAX_BOTS_PER_ROOM: u32 = 8;
 
 pub async fn run(
     room_id: RoomId,
@@ -129,13 +127,14 @@ pub async fn run(
     // PlayerIds of bots in this room. Brains run before each sim step.
     let mut bots: Vec<PlayerId> = Vec::new();
 
-    // Pre-populate with the requested number of bots. All share the same
-    // brain (`bot::sid_tick`) — names are just for HUD distinction.
+    // Pre-populate with the requested number of bots. Personality + name
+    // are picked at random by `bot::pick_bot_names` — weighted so Sid
+    // dominates the roster.
     let bot_id_base = BOT_PLAYER_ID_BASE + room_id as PlayerId * BOT_IDS_PER_ROOM;
-    let n = (bot_count as usize).min(BOT_NAMES.len());
-    for (i, name) in BOT_NAMES.iter().take(n).enumerate() {
+    let n = (bot_count as usize).min(MAX_BOTS_PER_ROOM as usize);
+    for (i, name) in crate::bot::pick_bot_names(n).into_iter().enumerate() {
         let pid = bot_id_base + i as PlayerId;
-        spawn_bot(pid, (*name).into(), &mut world, &mut players);
+        spawn_bot(pid, name, &mut world, &mut players);
         bots.push(pid);
     }
 

@@ -158,6 +158,44 @@ pub fn tick_for(name: &str, world: &World, ship: &Ship, state: &mut BotState) ->
     }
 }
 
+/// All bot display names. The first five map to specific personalities;
+/// the rest fall through to `sid_tick` via `tick_for`. Sampled WITHOUT
+/// replacement to fill a room — so a 4-bot room is 4 distinct names and
+/// the natural Sid bias comes from the three Sid-fallback names in the
+/// pool (Slugger / Spike / Diesel).
+pub const BOT_NAMES: [&str; 8] = [
+    "Sid", "Reaper", "Cobra", "Vega", "Wimpy", "Slugger", "Spike", "Diesel",
+];
+
+/// Pick `count` bot display names by random sampling WITHOUT replacement
+/// from `BOT_NAMES` (Fisher-Yates partial shuffle). Seeded from system
+/// time so every room composition is genuinely random — this isn't in
+/// the deterministic sim path.
+pub fn pick_bot_names(count: usize) -> Vec<String> {
+    let mut state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0xCAFEBABE_DEADBEEF);
+    // splitmix64 — small, no deps, good enough for picking 1–8 indices.
+    let mut next = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+
+    let mut pool: Vec<&str> = BOT_NAMES.to_vec();
+    let take = count.min(pool.len());
+    // Fisher-Yates: at step i, swap pool[i] with a random pool[i..end].
+    for i in 0..take {
+        let remaining = pool.len() - i;
+        let j = i + (next() as usize % remaining);
+        pool.swap(i, j);
+    }
+    pool.into_iter().take(take).map(|s| s.to_string()).collect()
+}
+
 // ── Wimpy ──────────────────────────────────────────────────────────────────
 // Plays like Sid most of the time. When a bullet trips the danger threshold
 // he commits to a 3–5 s FLEE: continuously re-evaluates "directly opposite

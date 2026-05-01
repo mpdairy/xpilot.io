@@ -949,6 +949,7 @@ impl World {
             let (p, v) = (s.pos, s.vel);
             events.push(GameEvent::ShipDied {
                 entity_id: id,
+                victim_player_id: s.player_id,
                 killer: None,
                 pos: p,
                 vel: v,
@@ -981,6 +982,7 @@ impl World {
                 let (p, v) = (s.pos, s.vel);
                 events.push(GameEvent::ShipDied {
                     entity_id: a_id,
+                    victim_player_id: s.player_id,
                     killer: b_player,
                     pos: p,
                     vel: v,
@@ -991,6 +993,7 @@ impl World {
                 let (p, v) = (s.pos, s.vel);
                 events.push(GameEvent::ShipDied {
                     entity_id: b_id,
+                    victim_player_id: s.player_id,
                     killer: a_player,
                     pos: p,
                     vel: v,
@@ -1049,6 +1052,7 @@ impl World {
                     let (p, v) = (s.pos, s.vel);
                     events.push(GameEvent::ShipDied {
                         entity_id: s_id,
+                        victim_player_id: s.player_id,
                         killer: None, // cannon kills don't credit a player
                         pos: p,
                         vel: v,
@@ -1148,6 +1152,7 @@ impl World {
                 self.ships.remove(&s_id);
                 events.push(GameEvent::ShipDied {
                     entity_id: s_id,
+                    victim_player_id: victim_player,
                     killer: shooter_player,
                     pos: death_pos,
                     vel: death_vel,

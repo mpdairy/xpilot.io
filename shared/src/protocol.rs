@@ -73,6 +73,10 @@ pub enum GameEvent {
     },
     ShipDied {
         entity_id: EntityId,
+        /// PlayerId of the dead ship. Carried in the event itself so clients
+        /// can label kill notifications without racing the next snapshot
+        /// (snapshots may arrive out of order with reliable events).
+        victim_player_id: PlayerId,
         killer: Option<PlayerId>,
         /// Where the ship died. Lets clients spawn explosion particles even
         /// though the ship is gone from the next snapshot.

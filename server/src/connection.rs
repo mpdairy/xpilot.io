@@ -13,6 +13,7 @@
 // need to know transports exist — it just sends ServerMessages.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -195,8 +196,33 @@ async fn dispatch_loop(
     let mut player_name: Option<String> = None;
     let mut current_room: Option<RoomHandle> = None;
 
+    // Idle timeout. Active clients send Input every tick (60 Hz once they
+    // join a room — the auto-join wires that up immediately on connect),
+    // so any window without traffic this long means the connection is
+    // dead even if TCP hasn't noticed yet. Without this, ghost
+    // connections from closed laptops / dropped Wi-Fi linger until
+    // kernel-level keepalive (default ~2 hours) finally times them out,
+    // and the same player reconnecting sees their old self still in the
+    // room.
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    let mut last_seen = Instant::now();
+    let mut idle_check = tokio::time::interval(Duration::from_secs(5));
+    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    idle_check.tick().await; // consume the immediate first tick
+
     loop {
         let cm: ClientMessage = tokio::select! {
+            _ = idle_check.tick() => {
+                if last_seen.elapsed() >= IDLE_TIMEOUT {
+                    tracing::info!(
+                        ?player_id,
+                        elapsed_s = last_seen.elapsed().as_secs(),
+                        "idle timeout — disconnecting",
+                    );
+                    break;
+                }
+                continue;
+            }
             ws_msg = ws_read.next() => {
                 let Some(maybe) = ws_msg else { break };
                 let msg = match maybe {
@@ -241,6 +267,10 @@ async fn dispatch_loop(
                 }
             }
         };
+
+        // Any decoded message — Hello, Input, signaling, etc. — counts as
+        // "alive". Reset the deadline.
+        last_seen = Instant::now();
 
         if !handle_message(
             cm,

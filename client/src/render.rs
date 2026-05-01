@@ -14,20 +14,43 @@ use crate::particles::ParticleField;
 const RADAR_MAX: f64 = 200.0;
 const RADAR_PAD: f64 = 10.0;
 
-/// One chat message in the on-screen log. Fades after a few seconds; the
-/// owner (lib.rs) caps the queue length.
+/// One chat message in the on-screen log. Fades after a long visible
+/// window. Owner (lib.rs) caps queue length.
 pub struct ChatLine {
     pub author: String,
     pub text: String,
+    pub kind: ChatKind,
     /// `performance.now()` ms when this landed.
     pub t_ms: f64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChatKind {
+    /// A chat message typed by a player.
+    Player,
+    /// A server-generated kill / death notification. Drawn in a
+    /// distinct colour so it doesn't blend with player chatter.
+    Kill,
+}
+
+/// Borrowed view of one entry in `App.personal_kills`. Just the player
+/// name + already-resolved colour + age — the renderer doesn't need a
+/// clock or any further lookup.
+pub struct PersonalKillView<'a> {
+    pub name: &'a str,
+    pub color: &'static str,
+    pub age_ms: f64,
+}
+
 /// Display schedule for chat lines: full alpha for `CHAT_VISIBLE_MS`, then
-/// linear fade over `CHAT_FADE_MS`, then dropped from the on-screen log
-/// (the queue itself is dropped on push when over cap, separately).
-const CHAT_VISIBLE_MS: f64 = 6_000.0;
-const CHAT_FADE_MS: f64 = 2_000.0;
+/// linear fade over `CHAT_FADE_MS`, then dropped from the on-screen log.
+/// 60 s + 5 s fade — sticks around about a minute so a player who looked
+/// away can scan back through what happened.
+const CHAT_VISIBLE_MS: f64 = 60_000.0;
+const CHAT_FADE_MS: f64 = 5_000.0;
+/// Cap on rendered lines. The queue itself can be longer; this just limits
+/// how many ever appear on-screen at once.
+const CHAT_DISPLAY_MAX: usize = 8;
 
 pub struct Camera {
     pub center: Vec2,
@@ -90,6 +113,19 @@ pub fn render(
     radar_walls: Option<&HtmlCanvasElement>,
     chat_log: &std::collections::VecDeque<ChatLine>,
     now_ms: f64,
+    // cursor_player_id: scoreboard cursor target (defaults to local player).
+    // Drives the `>` marker on the scoreboard row and the HUD direction dot.
+    // cursor_target_pos: world pos of the cursor's target ship, when alive.
+    // None hides the direction dot.
+    cursor_player_id: Option<EntityId>,
+    cursor_target_pos: Option<Vec2>,
+    // Stack of recent personal kill / death events. Entries are
+    // oldest-first (matches the Elm `Hud.messages` order). Renderer drops
+    // entries older than `PERSONAL_KILL_LIFETIME_MS` and stacks the rest
+    // upward from the HUD bottom dash.
+    personal_kills: &[PersonalKillView],
+    // Local player's current consecutive-kill streak since spawn.
+    kill_streak: u32,
 ) {
     let w = canvas.width() as f64;
     let h = canvas.height() as f64;
@@ -259,38 +295,83 @@ pub fn render(
         if let Some(charge) = local_shot_charge {
             draw_local_hud(ctx, w, h, charge);
         }
+        // Direction dot to whichever player the scoreboard cursor is on,
+        // skipping ourselves. Drawn as part of the HUD because the indicator
+        // only makes sense when we have a ship to be relative TO.
+        if let (Some(cursor_pid), Some(local_pid), Some(target_pos)) =
+            (cursor_player_id, local_player_id, cursor_target_pos)
+        {
+            if cursor_pid != local_pid {
+                let mw = world.map.width as f64;
+                let mh = world.map.height as f64;
+                let map_diag = (mw * mw + mh * mh).sqrt();
+                draw_target_indicator(
+                    ctx, &camera, follow, target_pos, w, h, map_diag, now_ms,
+                );
+            }
+        }
     }
 
     // Mini radar top-left, scoreboard top-right.
-    draw_minimap(ctx, world, local_player_id, radar_walls);
-    draw_scoreboard(ctx, w, players, local_player_id);
+    draw_minimap(ctx, world, local_player_id, cursor_player_id, radar_walls, now_ms);
+    draw_scoreboard(ctx, w, players, local_player_id, cursor_player_id);
 
     // Respawn countdown along the bottom of the HUD when waiting.
     if let Some(t) = respawn_remaining_seconds {
         draw_respawn_countdown(ctx, w, h, t);
     }
 
-    draw_chat(ctx, w, chat_log, now_ms);
+    // Player chat at the top (right of radar, growing downward), kill
+    // notifications at the bottom (right of radar, growing upward, newest
+    // closest to the bottom). Splitting them by anchor matches how the
+    // original xpilot let game events and player talk live in different
+    // regions instead of mixing them in one column.
+    draw_chat_pane(ctx, chat_log, now_ms, ChatKind::Player, ChatAnchor::Top);
+    draw_chat_pane(ctx, chat_log, now_ms, ChatKind::Kill, ChatAnchor::Bottom(h));
+
+    // Personal-kill stack inside the HUD area, plus streak below.
+    if local_alive {
+        draw_personal_kills(ctx, w, h, personal_kills, kill_streak);
+    }
 }
 
 /// Stack chat lines top-center of the canvas, oldest fading first. Lines
 /// past their visible+fade window are skipped (the queue itself isn't
 /// pruned here — that happens in lib.rs when it overflows the cap).
-fn draw_chat(
+/// Anchor side for a chat pane.
+///   - `Top`: pane sticks to the top of the screen, oldest at top, newest
+///     drawn just below — i.e. text grows DOWN.
+///   - `Bottom(canvas_h)`: pane sticks to the bottom; newest sits at the
+///     bottom, older lines drawn ABOVE — text grows UP.
+#[derive(Clone, Copy)]
+enum ChatAnchor {
+    Top,
+    Bottom(f64),
+}
+
+/// Renders one chat pane. Filters the shared log by `kind` so player chat
+/// and kill notifications can live in different regions and read as
+/// distinct streams (mirrors classic xpilot, which separated game events
+/// from player talk). Both panes share the exact same blue and font.
+fn draw_chat_pane(
     ctx: &CanvasRenderingContext2d,
-    canvas_w: f64,
     log: &std::collections::VecDeque<ChatLine>,
     now_ms: f64,
+    kind: ChatKind,
+    anchor: ChatAnchor,
 ) {
     if log.is_empty() {
         return;
     }
-    let line_h: f64 = 18.0;
-    let pad = 6.0;
-    let max_width = (canvas_w - 40.0).min(700.0);
-    // First-pass: collect lines with computed alpha (skip invisible ones).
-    let visible: Vec<(&ChatLine, f64)> = log
+    // line_h derived from `kind` further down so the bigger player font
+    // gets enough vertical room.
+    let pad = 4.0;
+    let max_width: f64 = 700.0;
+
+    // First pass: pick out lines of this kind that are still visible.
+    let filtered: Vec<(&ChatLine, f64)> = log
         .iter()
+        .filter(|l| l.kind == kind)
         .filter_map(|l| {
             let age = now_ms - l.t_ms;
             if age < CHAT_VISIBLE_MS {
@@ -303,35 +384,200 @@ fn draw_chat(
             }
         })
         .collect();
-    if visible.is_empty() {
+    if filtered.is_empty() {
         return;
     }
-    ctx.set_font("13px monospace");
+    // Cap at the newest CHAT_DISPLAY_MAX so old chatter doesn't fill the
+    // screen if many messages come in fast.
+    let start = filtered.len().saturating_sub(CHAT_DISPLAY_MAX);
+    let visible: Vec<(&ChatLine, f64)> = filtered.into_iter().skip(start).collect();
+
+    // Player chat: brighter, no backdrop. Kill messages: blue, slightly
+    // smaller, also no backdrop now (used to have a translucent black box).
+    // (font, color, backdrop, line_h, char_w)
+    let (font, color, backdrop, line_h, char_w) = match kind {
+        ChatKind::Player => ("14px monospace", "#fff", false, 17.0_f64, 8.4_f64),
+        ChatKind::Kill => ("11px monospace", "#9cf", false, 14.0_f64, 6.6_f64),
+    };
+    ctx.set_font(font);
     ctx.set_text_align("left");
-    let mut y = 8.0 + line_h;
-    for (line, alpha) in &visible {
-        let text = format!("{}: {}", line.author, line.text);
-        // Cap width by truncating the message text only — keep the author
-        // visible. Cheap heuristic: 7.5 px per monospace char at 13px.
-        let max_chars = ((max_width - 2.0 * pad) / 7.5) as usize;
+    let left_x = RADAR_PAD + RADAR_MAX + 12.0;
+
+    // Build a per-line iteration where (y, line, alpha) is set up for the
+    // chosen anchor. For Top: oldest first (top), newest last (bottom).
+    // For Bottom: newest first (bottom), older above.
+    let lines: Vec<(f64, &ChatLine, f64)> = match anchor {
+        ChatAnchor::Top => {
+            let mut y = 16.0 + line_h;
+            let mut out = Vec::with_capacity(visible.len());
+            for (l, a) in &visible {
+                out.push((y, *l, *a));
+                y += line_h;
+            }
+            out
+        }
+        ChatAnchor::Bottom(canvas_h) => {
+            let mut y = canvas_h - 12.0;
+            let mut out = Vec::with_capacity(visible.len());
+            for (l, a) in visible.iter().rev() {
+                out.push((y, *l, *a));
+                y -= line_h;
+            }
+            out
+        }
+    };
+
+    for (y, line, alpha) in &lines {
+        // Kill messages have an empty `author` — the formatted text already
+        // names killer + victim. Player chats keep "Name: text".
+        let text = if line.author.is_empty() {
+            line.text.clone()
+        } else {
+            format!("{}: {}", line.author, line.text)
+        };
+        let max_chars = ((max_width - 2.0 * pad) / char_w) as usize;
         let display: String = text.chars().take(max_chars).collect();
-        // Measure and draw a translucent backdrop so chat stays readable
-        // against bright explosions.
         let metrics_w = match ctx.measure_text(&display) {
             Ok(m) => m.width(),
-            Err(_) => display.chars().count() as f64 * 7.5,
+            Err(_) => display.chars().count() as f64 * char_w,
         };
-        let bx = (canvas_w - metrics_w) * 0.5 - pad;
-        let by = y - line_h + 4.0;
-        ctx.set_global_alpha(0.45 * *alpha);
-        ctx.set_fill_style_str("#000");
-        ctx.fill_rect(bx, by, metrics_w + pad * 2.0, line_h);
+        let bx = left_x;
+        if backdrop {
+            let by = y - line_h + 4.0;
+            ctx.set_global_alpha(0.45 * *alpha);
+            ctx.set_fill_style_str("#000");
+            ctx.fill_rect(bx, by, metrics_w + pad * 2.0, line_h);
+        }
         ctx.set_global_alpha(*alpha);
-        ctx.set_fill_style_str("#fff");
-        let _ = ctx.fill_text(&display, bx + pad, y);
-        y += line_h;
+        ctx.set_fill_style_str(color);
+        let _ = ctx.fill_text(&display, bx + pad, *y);
     }
     ctx.set_global_alpha(1.0);
+    ctx.set_text_align("start");
+}
+
+/// Lock-style direction dot for the scoreboard cursor's target — port of
+/// OG xpilot 4.5.x `Paint_lock` (see reference/xpilot-4.5.5/src/client/painthud.c).
+/// Lives INSIDE the HUD box at 60 % of the half-extent in the target's
+/// direction (an ellipse anchored on screen centre). Size is the classic
+/// `min(mapdiag / dist, 10)` inverse-distance formula, floored at 1 px.
+/// Blinks every other ~250 ms when the target is within `WARN_DIST` —
+/// matches OG's `lock_dist > WARNING_DISTANCE || warningCount++ % 2 == 0`.
+fn draw_target_indicator(
+    ctx: &CanvasRenderingContext2d,
+    camera: &Camera,
+    local_pos: Vec2,
+    target_pos: Vec2,
+    canvas_w: f64,
+    canvas_h: f64,
+    map_diag: f64,
+    now_ms: f64,
+) {
+    // 70% of the HUD's half-extents — sits well inside the box but a bit
+    // further from centre than OG's 0.6 so it doesn't visually crowd the
+    // ship icon at screen middle. HUD is 180×150 → half = 90×75.
+    const POS_FRAC: f64 = 0.7;
+    const HALF_W: f64 = 90.0;
+    const HALF_H: f64 = 75.0;
+    // Tighter cap than OG's 10 px — at our world scale the dot ballooned
+    // up too quickly when targets came in close. 5 px max keeps it as a
+    // marker, not a blob.
+    const SIZE_CAP: f64 = 5.0;
+    const SIZE_FLOOR: f64 = 1.0;
+    // Distance below which the dot starts blinking. Scaled to our world
+    // (≈12 % of map diagonal) so it kicks in at the same "they're getting
+    // close" range OG had relative to its visibility radius.
+    const WARN_DIST: f64 = 600.0;
+
+    let nearest = camera.nearest(target_pos);
+    let dx = (nearest.x - local_pos.x) as f64;
+    let dy = (nearest.y - local_pos.y) as f64;
+    let dist = ((dx * dx + dy * dy) as f64).sqrt();
+    if dist < 1e-3 {
+        return;
+    }
+
+    // Blink when close: visible every other 250 ms half-cycle.
+    let blink_on = dist > WARN_DIST || ((now_ms / 250.0) as i64) & 1 == 0;
+    if !blink_on {
+        return;
+    }
+
+    let angle = dy.atan2(dx);
+    let mid_x = canvas_w / 2.0;
+    let mid_y = canvas_h / 2.0;
+    let dot_x = mid_x + POS_FRAC * HALF_W * angle.cos();
+    let dot_y = mid_y + POS_FRAC * HALF_H * angle.sin();
+
+    // OG: size = min(mapdiag / lock_dist, 10), floored at 1.
+    let radius = (map_diag / dist).min(SIZE_CAP).max(SIZE_FLOOR);
+
+    ctx.set_fill_style_str("#070");
+    ctx.begin_path();
+    let _ = ctx.arc(dot_x, dot_y, radius, 0.0, core::f64::consts::TAU);
+    ctx.fill();
+}
+
+/// Personal-kill stack + kill-streak counter — port of `xpilot.elm:1240-1305`.
+///
+/// Stack: anchored at the HUD bottom-LEFT, stacking UPWARD with index 0
+/// (oldest) at the bottom and newer entries pushed above. Just the
+/// player's name; colour carries the meaning (green = killed them,
+/// yellow = died to them, dark red = "Yourself"). Italic bold monospace.
+/// Drops at 5 s like Elm's `tickHudMessages`, with a brief alpha fade
+/// in the final 1 s for polish.
+///
+/// Streak: green italic bold monospace number in the HUD bottom-RIGHT
+/// corner, matching `xpilot.elm:1294-1305`. Always visible (Elm always
+/// rendered `hud.kills` even when 0). Truncated at 999 to fit the
+/// 3-character box the original used.
+fn draw_personal_kills(
+    ctx: &CanvasRenderingContext2d,
+    canvas_w: f64,
+    canvas_h: f64,
+    kills: &[PersonalKillView],
+    kill_streak: u32,
+) {
+    const HUD_HALF_W: f64 = 90.0;
+    const HUD_HALF_H: f64 = 75.0;
+    const LIFETIME_MS: f64 = 5_000.0;
+    const FADE_MS: f64 = 1_000.0;
+    const STEP_PY: f64 = 16.0;
+
+    let mid_x = canvas_w / 2.0;
+    let mid_y = canvas_h / 2.0;
+    let left_x = mid_x - HUD_HALF_W;
+    let base_y = mid_y + HUD_HALF_H - 4.0;
+
+    ctx.set_font("italic bold 13px monospace");
+    ctx.set_text_align("left");
+
+    let visible: Vec<&PersonalKillView> =
+        kills.iter().filter(|k| k.age_ms < LIFETIME_MS).collect();
+    for (i, k) in visible.iter().enumerate() {
+        let y = base_y - STEP_PY * (i as f64);
+        let alpha = if k.age_ms < LIFETIME_MS - FADE_MS {
+            1.0
+        } else {
+            ((LIFETIME_MS - k.age_ms) / FADE_MS).clamp(0.0, 1.0)
+        };
+        ctx.set_global_alpha(alpha);
+        ctx.set_fill_style_str(k.color);
+        let _ = ctx.fill_text(k.name, left_x, y);
+    }
+    ctx.set_global_alpha(1.0);
+
+    // Kill-streak counter in HUD bottom-right corner. Elm:
+    //   x = middle.x + hudWidth/2 - 20, y = middle.y + hudHeight/2
+    //   String.left 3 (toString hud.kills)
+    // Right-align text and put its anchor near the inside-right of the
+    // box so the digits read inward from the energy bar.
+    ctx.set_font("italic bold 16px monospace");
+    ctx.set_fill_style_str("#008000");
+    ctx.set_text_align("right");
+    let display = kill_streak.min(999).to_string();
+    let _ = ctx.fill_text(&display, mid_x + HUD_HALF_W - 8.0, mid_y + HUD_HALF_H - 4.0);
+
     ctx.set_text_align("start");
 }
 
@@ -378,7 +624,9 @@ fn draw_minimap(
     ctx: &CanvasRenderingContext2d,
     world: &World,
     local_player_id: Option<EntityId>,
+    cursor_player_id: Option<EntityId>,
     radar_walls: Option<&HtmlCanvasElement>,
+    now_ms: f64,
 ) {
     let (radar_w, radar_h, scale) = match radar_dims(world.map.width, world.map.height) {
         Some(d) => d,
@@ -390,18 +638,24 @@ fn draw_minimap(
     ctx.set_fill_style_str("rgba(0, 0, 0, 0.55)");
     ctx.fill_rect(x, y, radar_w, radar_h);
 
-    // Walls drawn from a pre-rendered offscreen canvas — for big maps
-    // (newdarkhell is 200×200 = 40k cell tests) iterating each frame burns
-    // CPU for no reason since the wall layer never changes.
     if let Some(walls) = radar_walls {
         let _ = ctx.draw_image_with_html_canvas_element(walls, x, y);
     }
 
-    // Ship dots. Local player is yellow so they can find themself instantly,
-    // plus a small heading whisker so the player can tell which way they're
-    // pointing without leaving the radar.
+    // 2 Hz blink for the cursor's target dot — visible on for ~250 ms,
+    // off for ~250 ms. Skipped when cursor is on yourself.
+    let blink_on = ((now_ms / 250.0) as i64) & 1 == 0;
+
     for ship in world.ships.values() {
         let is_me = local_player_id.map_or(false, |me| me == ship.player_id);
+        let is_cursor =
+            !is_me && cursor_player_id.map_or(false, |c| c == ship.player_id);
+        // Cursor target: dot is straight-up hidden during the off-half of
+        // the blink (no overlay/size change). Same color/size as any other
+        // ship when it IS visible — pure on/off rhythm.
+        if is_cursor && !blink_on {
+            continue;
+        }
         let color = if is_me { "#ff0" } else { "#fff" };
         ctx.set_fill_style_str(color);
         let sx = x + ship.pos.x as f64 * scale;
@@ -478,6 +732,7 @@ fn draw_scoreboard(
     canvas_w: f64,
     players: &[PlayerInfo],
     local_player_id: Option<EntityId>,
+    cursor_player_id: Option<EntityId>,
 ) {
     let line_h = 16.0;
     let pad = 8.0;
@@ -495,7 +750,8 @@ fn draw_scoreboard(
 
     ctx.set_font("13px monospace");
     ctx.set_fill_style_str("#6cf");
-    let _ = ctx.fill_text("name               K   D", x + pad, y + pad + line_h - 3.0);
+    // Two extra spaces in the header for the "> " cursor column on the left.
+    let _ = ctx.fill_text("  name               K   D", x + pad, y + pad + line_h - 3.0);
 
     let mut sorted: Vec<&PlayerInfo> = players.iter().collect();
     sorted.sort_by_key(|p| -(p.kills as i64 - p.deaths as i64));
@@ -503,6 +759,7 @@ fn draw_scoreboard(
     for (i, p) in sorted.iter().enumerate() {
         let row_y = y + pad + line_h * (i as f64 + 2.0) - 3.0;
         let is_me = local_player_id.map_or(false, |me| me == p.player_id);
+        let is_cursor = cursor_player_id.map_or(false, |c| c == p.player_id);
         let color = if !p.dead {
             if is_me { "#ff0" } else { "#fff" }
         } else if is_me {
@@ -510,17 +767,21 @@ fn draw_scoreboard(
         } else {
             "#888"
         };
-        ctx.set_fill_style_str(color);
         let mut name = display_name(p);
-        // Cap at 16 chars rather than 12 so the " [bot]" suffix on a 10-char
-        // bot name still fits without surprise truncation. Scoreboard column
-        // widens to match.
         name.truncate(16);
+        // Draw the row text first, then overlay a yellow `>` for the cursor
+        // row. Splitting these lets the cursor stay yellow regardless of
+        // whether the highlighted player is alive / dead / you.
+        ctx.set_fill_style_str(color);
         let _ = ctx.fill_text(
-            &format!("{:<16}  {:>3} {:>3}", name, p.kills, p.deaths),
+            &format!("  {:<16}  {:>3} {:>3}", name, p.kills, p.deaths),
             x + pad,
             row_y,
         );
+        if is_cursor {
+            ctx.set_fill_style_str("#ff0");
+            let _ = ctx.fill_text(">", x + pad, row_y);
+        }
     }
 }
 

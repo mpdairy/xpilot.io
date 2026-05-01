@@ -143,10 +143,13 @@
       /* Chat compose box. Hidden by default; M key opens + focuses, Enter
          sends, Escape cancels. Sits above the canvas, below the lobby. */
       #chat-input {
+        /* Dead-center vertically + horizontally — chat messages are pinned
+           to the top-left, so the compose box has to live somewhere it
+           won't cover them while you're typing. */
         position: fixed;
-        top: 10px;
+        top: 50%;
         left: 50%;
-        transform: translateX(-50%);
+        transform: translate(-50%, -50%);
         z-index: 7;
         width: 600px;
         max-width: calc(100vw - 40px);

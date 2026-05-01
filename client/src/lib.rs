@@ -78,6 +78,30 @@ struct App {
     /// arrival time so the renderer can fade old lines out and drop them
     /// once they're invisible.
     chat_log: VecDeque<render::ChatLine>,
+    /// PlayerId of the player highlighted in the scoreboard. PgUp/PgDn
+    /// move the cursor; default = local player. When pointed at someone
+    /// else, the HUD shows a green direction dot toward that ship.
+    /// `None` until the first snapshot tells us our own player_id.
+    selected_player_id: Option<shared::entities::PlayerId>,
+    /// Stack of recent personal kill / death events involving the local
+    /// player. Oldest at the front (drawn at the bottom of the stack);
+    /// newest pushes onto the back and stacks upward. Lines older than
+    /// `PERSONAL_KILL_LIFETIME_MS` get dropped at render time.
+    /// Mirrors the Elm version's `Hud.messages` list.
+    personal_kills: VecDeque<PersonalKill>,
+    /// Local player's current consecutive-kill count since spawn. Resets
+    /// to 0 on each death. The Elm version had `lifeKills` for this but
+    /// commented out the on-screen display — re-adding here per request.
+    kill_streak: u32,
+}
+
+#[derive(Clone)]
+struct PersonalKill {
+    /// Just the other player's name (or "Yourself" for suicide). Color
+    /// carries the "I killed / I died" meaning, no verb in the text.
+    name: String,
+    color: &'static str,
+    t_ms: f64,
 }
 
 const CHAT_MAX_LINES: usize = 20;
@@ -188,10 +212,13 @@ pub fn start() -> Result<(), JsValue> {
         first_join_pending: true,
         current_room_id: None,
         chat_log: VecDeque::with_capacity(CHAT_MAX_LINES),
+        selected_player_id: None,
+        personal_kills: VecDeque::with_capacity(8),
+        kill_streak: 0,
     });
 
     load_saved_name(&window, &document);
-    install_name_persistence(&window, &document)?;
+    install_name_persistence(&window, &document, app.clone())?;
     set_ui_mode(&document, UiMode::LobbyOnly);
     install_lobby_handlers(&document, app.clone())?;
     install_lobby_overlay_handlers(&window, &document, app.clone())?;
@@ -231,10 +258,18 @@ fn load_saved_name(window: &web_sys::Window, doc: &Document) {
     }
 }
 
-/// Persist #player-name to localStorage on every keystroke. Trim before
-/// saving so a stray space doesn't survive across reloads. No debounce —
-/// localStorage writes are fast enough that per-keystroke is fine.
-fn install_name_persistence(window: &web_sys::Window, doc: &Document) -> Result<(), JsValue> {
+/// On every keystroke in #player-name: save to localStorage AND push the
+/// current value to the server as `SetName`. Without the live server push
+/// the rename only took effect after a reload (or any lobby action that
+/// happened to re-send the name) — confusing for anyone trying to set
+/// their name mid-game. Trim before saving so a stray space doesn't
+/// survive across reloads. No debounce: keystrokes are small messages
+/// and there are at most ~10/sec even when typing fast.
+fn install_name_persistence(
+    window: &web_sys::Window,
+    doc: &Document,
+    app: Rc<RefCell<Option<App>>>,
+) -> Result<(), JsValue> {
     let Some(input) = doc
         .get_element_by_id("player-name")
         .and_then(|el| el.dyn_into::<HtmlInputElement>().ok())
@@ -248,7 +283,18 @@ fn install_name_persistence(window: &web_sys::Window, doc: &Document) -> Result<
     let input_for_cb = input.clone();
     let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_ev| {
         let v = input_for_cb.value();
-        let _ = storage.set_item(NAME_STORAGE_KEY, v.trim());
+        let trimmed = v.trim().to_string();
+        let _ = storage.set_item(NAME_STORAGE_KEY, &trimmed);
+        // Also push to the server so other players see the new name in
+        // their next snapshot. Skip if the transport hasn't connected yet
+        // — the Hello message picks up the current value.
+        if !trimmed.is_empty() {
+            if let Some(a) = app.borrow().as_ref() {
+                if a.transport.is_open() {
+                    a.transport.send(&ClientMessage::SetName { name: trimmed });
+                }
+            }
+        }
     });
     input.add_event_listener_with_callback("input", cb.as_ref().unchecked_ref())?;
     cb.forget();
@@ -516,6 +562,70 @@ fn perf_now() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// True if the given player_id is a server-spawned bot. Defaults to false
+/// (human-ish) if the player isn't in the latest snapshot — better to
+/// over-show a kill than miss one.
+fn lookup_is_bot(app: &App, player_id: shared::entities::PlayerId) -> bool {
+    app.game
+        .as_ref()
+        .and_then(|g| g.latest_snapshot.as_ref())
+        .and_then(|ts| ts.snap.players.iter().find(|p| p.player_id == player_id))
+        .map(|p| p.is_bot)
+        .unwrap_or(false)
+}
+
+/// Look up a player's display name from the latest snapshot's PlayerInfo
+/// list. Bots get a "(R)" suffix to distinguish from human players.
+/// Falls back to "p<id>" if the player isn't in the current snapshot
+/// (race between event delivery and snapshot — rare but possible).
+fn lookup_player_name(app: &App, player_id: shared::entities::PlayerId) -> String {
+    app.game
+        .as_ref()
+        .and_then(|g| g.latest_snapshot.as_ref())
+        .and_then(|ts| ts.snap.players.iter().find(|p| p.player_id == player_id))
+        .map(|p| {
+            if p.is_bot {
+                format!("{} (R)", p.name)
+            } else {
+                p.name.clone()
+            }
+        })
+        .unwrap_or_else(|| format!("p{}", player_id))
+}
+
+/// Push a line into the chat log, evicting the oldest if at capacity.
+fn push_chat_line(app: &mut App, author: String, text: String, kind: render::ChatKind) {
+    if app.chat_log.len() == CHAT_MAX_LINES {
+        app.chat_log.pop_front();
+    }
+    app.chat_log.push_back(render::ChatLine {
+        author,
+        text,
+        kind,
+        t_ms: perf_now(),
+    });
+}
+
+/// Build a kill / death notification line in the classic XPilot style.
+/// Picks a verb based on `t_ms` so consecutive kills don't all read the
+/// same — same flavour the original used for its "smoked", "fragged",
+/// "killed" messages. Suicide form when no killer is credited.
+fn kill_message(killer: Option<&str>, victim: &str, t_ms: f64) -> String {
+    let kill_verbs = ["killed", "fragged", "nailed", "blasted", "smoked", "wasted"];
+    let suicide_verbs = ["crashed and burned", "ate dust", "self-destructed", "splattered"];
+    let bucket = (t_ms as u64 / 17) as usize;
+    match killer {
+        Some(k) => {
+            let v = kill_verbs[bucket % kill_verbs.len()];
+            format!("{} {} {}", k, v, victim)
+        }
+        None => {
+            let v = suicide_verbs[bucket % suicide_verbs.len()];
+            format!("{} {}", victim, v)
+        }
+    }
+}
+
 fn install_focus_clear(
     window: &web_sys::Window,
     app: Rc<RefCell<Option<App>>>,
@@ -619,6 +729,60 @@ fn install_lobby_overlay_handlers(
     });
     window.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref())?;
     on_key.forget();
+
+    // PageUp / PageDown — move the scoreboard target cursor. Same sort the
+    // scoreboard uses (net kills desc), so the cursor visually steps row
+    // by row. Skip while chat or a form field has focus so typing in the
+    // chat / name fields isn't intercepted.
+    let app_pg = app.clone();
+    let doc_pg = doc.clone();
+    let on_pg = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(
+        move |ev: web_sys::KeyboardEvent| {
+            let key = ev.key();
+            if key != "PageUp" && key != "PageDown" {
+                return;
+            }
+            if !is_hidden(&doc_pg, "chat-input") {
+                return;
+            }
+            if active_is_form_field(&doc_pg) {
+                return;
+            }
+            let mut guard = app_pg.borrow_mut();
+            let Some(a) = guard.as_mut() else { return };
+            let Some(g) = a.game.as_ref() else { return };
+            let Some(snap) = g.latest_snapshot.as_ref().map(|t| &t.snap) else {
+                return;
+            };
+            // Sort same way the scoreboard does so cursor movement matches
+            // what the user sees on the right.
+            let mut sorted: Vec<&shared::protocol::PlayerInfo> = snap.players.iter().collect();
+            sorted.sort_by_key(|p| -(p.kills as i64 - p.deaths as i64));
+            if sorted.is_empty() {
+                return;
+            }
+            let local_pid = snap
+                .ships
+                .iter()
+                .find(|sh| sh.entity_id == g.local_ship)
+                .map(|sh| sh.player_id);
+            // Default cursor = local player; otherwise use whatever was
+            // remembered (if it's still in the room).
+            let current = a.selected_player_id.or(local_pid);
+            let cur_idx = current
+                .and_then(|pid| sorted.iter().position(|p| p.player_id == pid))
+                .unwrap_or(0);
+            let new_idx = match key.as_str() {
+                "PageUp" => cur_idx.saturating_sub(1),
+                "PageDown" => (cur_idx + 1).min(sorted.len() - 1),
+                _ => cur_idx,
+            };
+            a.selected_player_id = Some(sorted[new_idx].player_id);
+            ev.prevent_default(); // stop the browser from page-scrolling
+        },
+    );
+    window.add_event_listener_with_callback("keydown", on_pg.as_ref().unchecked_ref())?;
+    on_pg.forget();
 
     // Rooms button — only visible while in GameOnly mode (set_ui_mode hides
     // it whenever the lobby is up), so a click always means "open lobby".
@@ -1008,27 +1172,93 @@ fn handle_server_message(app: &mut App, msg: ServerMessage) {
             // — incoming chats are kept even if the snapshot pump hasn't
             // populated the world yet (e.g. immediately after JoinedRoom).
             if let GameEvent::Chat { player_id, ref text } = ev {
-                let author = app
-                    .game
-                    .as_ref()
-                    .and_then(|g| g.latest_snapshot.as_ref())
-                    .and_then(|ts| ts.snap.players.iter().find(|p| p.player_id == player_id))
-                    .map(|p| {
-                        if p.is_bot {
-                            format!("{} (R)", p.name)
-                        } else {
-                            p.name.clone()
-                        }
-                    })
-                    .unwrap_or_else(|| format!("p{}", player_id));
-                if app.chat_log.len() == CHAT_MAX_LINES {
-                    app.chat_log.pop_front();
-                }
-                app.chat_log.push_back(render::ChatLine {
-                    author,
-                    text: text.clone(),
-                    t_ms: perf_now(),
+                let author = lookup_player_name(app, player_id);
+                push_chat_line(app, author, text.clone(), render::ChatKind::Player);
+            }
+            // Kill notifications: only push to the chat log if a HUMAN was
+            // involved — bot-on-bot fights would otherwise drown the chat.
+            // Always update personal stats (last_personal_kill + streak)
+            // when the local player is the killer or victim.
+            if let GameEvent::ShipDied {
+                victim_player_id,
+                killer,
+                ..
+            } = ev
+            {
+                let victim_is_bot = lookup_is_bot(app, victim_player_id);
+                let killer_is_bot = killer.map(|k| lookup_is_bot(app, k));
+                let victim_name = lookup_player_name(app, victim_player_id);
+                let killer_name = killer.map(|k| lookup_player_name(app, k));
+                let local_pid = app.game.as_ref().and_then(|g| {
+                    g.latest_snapshot
+                        .as_ref()
+                        .and_then(|ts| {
+                            ts.snap
+                                .ships
+                                .iter()
+                                .find(|sh| sh.entity_id == g.local_ship)
+                        })
+                        .map(|sh| sh.player_id)
                 });
+
+                // Human-involved filter: human victim OR (human killer AND
+                // killer != victim, so suicides count as one party).
+                let any_human = !victim_is_bot
+                    || killer_is_bot.map(|b| !b).unwrap_or(false);
+                if any_human {
+                    let text = match killer {
+                        Some(k) if k != victim_player_id => kill_message(
+                            killer_name.as_deref(),
+                            &victim_name,
+                            perf_now(),
+                        ),
+                        _ => kill_message(None, &victim_name, perf_now()),
+                    };
+                    push_chat_line(app, String::new(), text, render::ChatKind::Kill);
+                }
+
+                // Personal stats — ports the Elm version's `hudMessage`
+                // colour map exactly: green for kills, yellow for deaths
+                // by enemy fire, dark red for suicide ("Yourself").
+                if let Some(me) = local_pid {
+                    let new_pk = if victim_player_id == me {
+                        app.kill_streak = 0;
+                        match killer {
+                            Some(k) if k != me => Some(PersonalKill {
+                                name: killer_name
+                                    .clone()
+                                    .unwrap_or_else(|| "?".into()),
+                                color: "#aaaa00",
+                                t_ms: perf_now(),
+                            }),
+                            // killer == me, or no killer (wall crash) →
+                            // both read as "you did this to yourself".
+                            _ => Some(PersonalKill {
+                                name: "Yourself".into(),
+                                color: "#aa0000",
+                                t_ms: perf_now(),
+                            }),
+                        }
+                    } else if killer == Some(me) {
+                        app.kill_streak = app.kill_streak.saturating_add(1);
+                        Some(PersonalKill {
+                            name: victim_name.clone(),
+                            color: "#008000",
+                            t_ms: perf_now(),
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(pk) = new_pk {
+                        // Match the Elm `hudMessage`: append to the END of
+                        // the list. Renderer iterates with index for the
+                        // y = bottom - 15*i layout.
+                        if app.personal_kills.len() >= 8 {
+                            app.personal_kills.pop_front();
+                        }
+                        app.personal_kills.push_back(pk);
+                    }
+                }
             }
             if let Some(g) = app.game.as_mut() {
                 if let GameEvent::ShipDied { entity_id, pos, .. } = ev {
@@ -1133,6 +1363,16 @@ fn frame(app_cell: &Rc<RefCell<Option<App>>>, timestamp_ms: f64) {
             let elapsed = ((timestamp_ms - t) / 1000.0) as f32;
             (SHIP_RESPAWN_SECONDS - elapsed).max(0.0)
         });
+        // Cursor target = whatever PgUp/PgDn picked, defaulting to local
+        // player. World position resolved via the snapshot's ships list —
+        // None if the target's ship isn't currently alive (don't draw the
+        // direction dot in that case).
+        let cursor_pid = app.selected_player_id.or(local_pid);
+        let cursor_target_pos = cursor_pid.and_then(|pid| {
+            newest
+                .and_then(|s| s.ships.iter().find(|sh| sh.player_id == pid))
+                .map(|sh| sh.pos)
+        });
         render::render(
             &app.ctx,
             &app.canvas,
@@ -1147,6 +1387,21 @@ fn frame(app_cell: &Rc<RefCell<Option<App>>>, timestamp_ms: f64) {
             g.radar_walls.as_ref(),
             &app.chat_log,
             timestamp_ms,
+            cursor_pid,
+            cursor_target_pos,
+            // Personal-kill stack: borrowed slice of (name, color, age).
+            // Renderer drops the ones older than its lifetime and stacks
+            // the rest upward from the HUD bottom dash.
+            &app
+                .personal_kills
+                .iter()
+                .map(|pk| render::PersonalKillView {
+                    name: &pk.name,
+                    color: pk.color,
+                    age_ms: timestamp_ms - pk.t_ms,
+                })
+                .collect::<Vec<_>>(),
+            app.kill_streak,
         );
     } else {
         render::render_status(&app.ctx, &app.canvas, &app.status);
